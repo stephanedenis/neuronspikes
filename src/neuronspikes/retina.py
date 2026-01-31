@@ -120,6 +120,11 @@ class RetinaLayer:
         # Résultat: (H, W, 256) booléens
         self._current_spike_trains = INTENSITY_TO_SPIKES[frame]
         
+        # Compter les spikes pour cette frame (= somme des intensités)
+        frame_spikes = int(frame.sum())
+        self.state.total_spikes += frame_spikes
+        self.stats['total_spikes'] += frame_spikes
+        
         # Reset de l'index de slot pour la nouvelle frame
         self.state.slot_index = 0
         self.state.frame_index += 1
@@ -148,16 +153,16 @@ class RetinaLayer:
         Cette méthode fait progresser le temps d'un slot (~65µs @ 60fps)
         et retourne les neurones qui s'activent à ce moment.
         
+        Note: Les spikes sont déjà comptés dans process_frame().
+        step() sert à l'analyse fine des groupes d'activation.
+        
         Returns:
             NDArray[np.bool_]: Masque d'activation (H, W)
         """
         activations = self.get_activations()
         
-        # Statistiques
+        # Compter les groupes d'activation (patterns simultanés)
         spike_count = int(np.sum(activations))
-        self.state.total_spikes += spike_count
-        self.stats['total_spikes'] += spike_count
-        
         if spike_count > 0:
             self.stats['activation_groups'] += 1
         
