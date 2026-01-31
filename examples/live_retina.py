@@ -35,6 +35,7 @@ from neuronspikes import (
     create_retina, RetinaLayer, 
     GroupDetector, GroupDetectorConfig, visualize_groups,
     NeuronLayer, GenesisConfig, NeuronConfig, visualize_neurons,
+    HebbianLayer, SynapticConfig,
 )
 from neuronspikes.temporal import TemporalCorrelator, CorrelationConfig, visualize_patterns
 
@@ -50,6 +51,7 @@ class VisualizerConfig:
     show_stats: bool = True
     show_groups: bool = True  # Afficher les groupes d'activation
     show_patterns: bool = True  # Afficher les patterns temporels
+    show_hebbian: bool = True  # Afficher l'apprentissage Hebbien
     intensity_threshold: int = 200  # Seuil pour détecter les activations "fortes"
 
 
@@ -108,6 +110,17 @@ class RetinaVisualizer:
             )
         )
         
+        # Couche Hebbienne pour l'apprentissage synaptique
+        # Sera initialisée quand les premiers neurones seront créés
+        self.hebbian_layer: HebbianLayer | None = None
+        self._hebbian_config = SynapticConfig(
+            learning_rate=0.1,
+            excitation_strength=0.3,
+            inhibition_strength=-0.5,
+            feedback_ratio=-0.8,
+            weight_decay=0.999
+        )
+        
         # Capture vidéo
         self.cap: cv2.VideoCapture | None = None
         
@@ -115,6 +128,7 @@ class RetinaVisualizer:
         self._last_valid_frame: NDArray[np.uint8] | None = None
         self._last_display: NDArray[np.uint8] | None = None
         self._last_groups_count: int = 0
+        self._last_synapse_count: int = 0
         
         # Statistiques
         self.fps_history: list[float] = []
@@ -201,6 +215,29 @@ class RetinaVisualizer:
         neuron_output = self.neuron_layer.process(activations)
         neurons_img = visualize_neurons(self.neuron_layer, show_potentials=True)
         
+        # Apprentissage Hebbien: mise à jour des synapses entre neurones
+        if self.config.show_hebbian and self.neuron_layer.neuron_count > 0:
+            # Initialiser HebbianLayer si nécessaire
+            if self.hebbian_layer is None:
+                self.hebbian_layer = HebbianLayer(
+                    self.neuron_layer.neurons,
+                    self._hebbian_config,
+                    enable_feedback=True,
+                    enable_lateral_inhibition=True
+                )
+            else:
+                # Mettre à jour la référence aux neurones (nouveaux créés)
+                self.hebbian_layer.neurons = self.neuron_layer.neurons
+            
+            # Calculer les activations des neurones pour Hebbian
+            neuron_activations = {}
+            for nid, neuron in self.neuron_layer.neurons.items():
+                neuron_activations[nid] = neuron.potential
+            
+            # Traiter avec apprentissage Hebbien
+            spiked = self.hebbian_layer.process(neuron_activations, learn=True)
+            self._last_synapse_count = self.hebbian_layer.network.synapse_count
+        
         # Stats patterns et neurones
         self._stable_pattern_count = len(self.correlator.stable_patterns)
         
@@ -275,11 +312,12 @@ class RetinaVisualizer:
         # Ajouter les labels
         font = cv2.FONT_HERSHEY_SIMPLEX
         neuron_count = self.neuron_layer.neuron_count
+        synapse_count = self._last_synapse_count
         cv2.putText(combined, "ENTREE", (10, 20), font, 0.5, (255, 255, 255), 1)
         cv2.putText(combined, "RETINE", (display_size + 10, 20), font, 0.5, (255, 255, 255), 1)
         cv2.putText(combined, f"GROUPES ({self._last_groups_count})", (display_size * 2 + 5, 20), font, 0.4, (255, 255, 255), 1)
         cv2.putText(combined, f"PATTERNS ({self._stable_pattern_count})", (display_size * 3 + 5, 20), font, 0.4, (255, 255, 255), 1)
-        cv2.putText(combined, f"NEURONES ({neuron_count})", (display_size * 4 + 5, 20), font, 0.4, (255, 255, 255), 1)
+        cv2.putText(combined, f"N:{neuron_count} S:{synapse_count}", (display_size * 4 + 5, 20), font, 0.4, (255, 255, 255), 1)
         
         if self.config.show_stats:
             # Stats en bas
@@ -288,7 +326,7 @@ class RetinaVisualizer:
             layer_stats = self.neuron_layer.get_stats()
             cv2.putText(
                 combined, 
-                f"FPS: {fps:.1f} | F: {self.frame_count} | P: {correlator_stats['active_patterns']} | N: {neuron_count} | Spikes: {layer_stats['total_spikes']}",
+                f"FPS: {fps:.1f} | F: {self.frame_count} | P: {correlator_stats['active_patterns']} | N: {neuron_count} | Syn: {synapse_count} | Spikes: {layer_stats['total_spikes']}",
                 (10, stats_y), 
                 font, 0.4, (0, 255, 0), 1
             )

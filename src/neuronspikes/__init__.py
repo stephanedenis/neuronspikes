@@ -37,6 +37,11 @@ __all__ = [
     "SynapticConfig",
     "SynapticNetwork",
     "HebbianLayer",
+    # Fabric et Cortex
+    "Fabric",
+    "FabricConfig",
+    "LearningCapability",
+    "Cortex",
 ]
 
 from .model import SpikingModel
@@ -46,3 +51,4 @@ from .groups import GroupDetector, GroupDetectorConfig, ActivationGroup, visuali
 from .temporal import TemporalPattern, TemporalCorrelator, CorrelationConfig, visualize_patterns
 from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConfig, visualize_neurons
 from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
+from .fabric import Fabric, FabricConfig, LearningCapability, Cortex
