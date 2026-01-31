@@ -49,6 +49,16 @@ __all__ = [
     "PolarCell",
     "StereoFovea",
     "visualize_fovea",
+    # Attention et mémoire
+    "ZoomConfig",
+    "ZoomLevel",
+    "AttentionConfig",
+    "VirtualZoom",
+    "InhibitionMap",
+    "AttentionMemory",
+    "AttentionController",
+    "GazeMemory",
+    "PointOfInterest",
     # OpenCL Backend
     "OpenCLBackend",
     "get_opencl_backend",
@@ -65,4 +75,9 @@ from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConf
 from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
 from .fabric import Fabric, FabricConfig, LearningCapability, Cortex
 from .fovea import Fovea, FoveaConfig, GazePoint, PolarCell, StereoFovea, visualize_fovea
+from .attention import (
+    ZoomConfig, ZoomLevel, AttentionConfig, VirtualZoom,
+    InhibitionMap, AttentionMemory, AttentionController,
+    GazeMemory, PointOfInterest
+)
 from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices

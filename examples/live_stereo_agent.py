@@ -48,6 +48,10 @@ from neuronspikes import (
     visualize_fovea,
     get_opencl_backend,
     is_opencl_available,
+    # Système d'attention avec zoom et mémoire
+    AttentionController,
+    AttentionConfig,
+    ZoomConfig,
 )
 
 
@@ -157,6 +161,7 @@ class AttentionAgent:
     
     Cherche activement les détails communs entre les deux yeux.
     Utilise OpenCL pour accélérer le traitement GPU si disponible.
+    Intègre zoom virtuel, mémoire des positions et rétroaction inhibitrice.
     """
     
     def __init__(
@@ -180,6 +185,28 @@ class AttentionAgent:
             except Exception as e:
                 print(f"OpenCL désactivé: {e}")
                 self.opencl = None
+        
+        # Système d'attention avec zoom et mémoire
+        zoom_cfg = ZoomConfig(
+            min_scale=0.25,   # Vue 4× plus large
+            max_scale=2.0,    # Vue 2× plus proche
+            num_levels=8,
+            zoom_speed=0.1
+        )
+        attention_cfg = AttentionConfig(
+            memory_size=100,
+            inhibition_decay=0.95,
+            inhibition_radius=48.0,
+            habituation_rate=0.1,
+            exploration_weight=0.3
+        )
+        self.attention = AttentionController(
+            image_width=frame_width,
+            image_height=frame_height,
+            base_fovea_config=fovea_config,
+            zoom_config=zoom_cfg,
+            attention_config=attention_cfg
+        )
         
         # Deux fovéas indépendantes
         self.left_fovea = Fovea(fovea_config)
@@ -392,9 +419,16 @@ class AttentionAgent:
     def decide_next_action(
         self,
         correlation: float,
-        saliency_peaks: List[SaliencyPoint]
+        saliency_peaks: List[SaliencyPoint],
+        saliency_map: Optional[np.ndarray] = None,
+        features: Optional[np.ndarray] = None
     ) -> Optional[Tuple[float, float]]:
         """Décide de la prochaine action du regard.
+        
+        Utilise le système d'attention avec:
+        - Inhibition de retour (évite les zones récemment visitées)
+        - Mémoire des positions (exploration vs exploitation)
+        - Zoom adaptatif
         
         Returns:
             Nouvelle cible (x, y) ou None si pas de mouvement
@@ -408,25 +442,70 @@ class AttentionAgent:
         if frames_since_saccade < self.min_saccade_interval:
             return None
         
-        # Si faible corrélation, chercher un meilleur point
-        if correlation < 0.3 and saliency_peaks:
-            # Saccade vers le pic le plus saillant
-            best = saliency_peaks[0]
-            return (best.x, best.y)
+        # Mettre à jour le système d'attention
+        self.attention.update(
+            saliency=saliency_map,
+            correlation=correlation,
+            features=features
+        )
         
-        # Si en fixation stable depuis longtemps, explorer
-        if self.gaze.is_fixating and self.gaze.fixation_time > 15:
-            if saliency_peaks:
-                # Choisir un pic différent de la position actuelle
+        # Auto-zoom basé sur la corrélation et saillance
+        current_saliency = 0.0
+        if saliency_peaks:
+            current_saliency = saliency_peaks[0].strength
+        self.attention.auto_zoom(correlation, current_saliency)
+        
+        # Si faible corrélation ou en exploration, chercher nouvelle cible
+        if correlation < 0.3 or (self.gaze.is_fixating and self.gaze.fixation_time > 15):
+            if saliency_map is not None:
+                # Utiliser l'attention controller pour sélectionner la cible
+                # avec inhibition de retour
+                target = self.attention.select_next_target(saliency_map, correlation)
+                
+                # Vérifier que c'est assez différent de la position actuelle
+                dist = math.sqrt(
+                    (target[0] - self.gaze.x)**2 + 
+                    (target[1] - self.gaze.y)**2
+                )
+                if dist > 30:
+                    return target
+            elif saliency_peaks:
+                # Fallback: utiliser les pics si pas de carte
+                # mais moduler par l'inhibition
                 for peak in saliency_peaks:
-                    dist = math.sqrt(
-                        (peak.x - self.gaze.x)**2 + 
-                        (peak.y - self.gaze.y)**2
-                    )
-                    if dist > 50:  # Assez loin
-                        return (peak.x, peak.y)
+                    inhibition = self.attention.inhibition.get_inhibition_at(peak.x, peak.y)
+                    if inhibition < 0.5:  # Pas trop inhibé
+                        dist = math.sqrt(
+                            (peak.x - self.gaze.x)**2 + 
+                            (peak.y - self.gaze.y)**2
+                        )
+                        if dist > 30:
+                            return (peak.x, peak.y)
         
         return None
+    
+    @property
+    def current_zoom_level(self) -> int:
+        """Niveau de zoom courant (0-7)."""
+        return self.attention.zoom.level_index
+    
+    @property
+    def current_zoom_scale(self) -> float:
+        """Échelle de zoom courante."""
+        return self.attention.zoom.current_scale
+    
+    @property
+    def effective_radius(self) -> int:
+        """Rayon effectif de la fovéa (ajusté au zoom)."""
+        return self.attention.zoom.current_radius
+    
+    def zoom_in(self):
+        """Zoom avant (plus de détails)."""
+        self.attention.zoom.zoom_in()
+    
+    def zoom_out(self):
+        """Zoom arrière (vue plus large)."""
+        self.attention.zoom.zoom_out()
     
     def process(
         self,
@@ -502,15 +581,28 @@ class AttentionAgent:
         if len(self.correlation_history) > 100:
             self.correlation_history.pop(0)
         
-        # Décider de la prochaine action
-        next_target = self.decide_next_action(correlation, saliency_peaks)
+        # Combiner les cartes de saillance pour le système d'attention
+        combined_saliency = (saliency_left + saliency_right) / 2
+        
+        # Décider de la prochaine action (avec inhibition de retour et zoom)
+        next_target = self.decide_next_action(
+            correlation, 
+            saliency_peaks,
+            saliency_map=combined_saliency,
+            features=left_act
+        )
         if next_target is not None:
-            self.gaze.saccade_to(*next_target)
+            # Contraindre la cible aux limites (ajustées au zoom)
+            x, y = self.attention.zoom.constrain_gaze(*next_target)
+            self.gaze.saccade_to(x, y)
             self.last_saccade_frame = self.frame_count
         
         # Sauvegarder pour comparaison temporelle
         self.prev_left_act = left_act.copy()
         self.prev_right_act = right_act.copy()
+        
+        # Mettre à jour le zoom (transition lisse)
+        self.attention.zoom.update()
         
         return {
             'gaze_x': gaze_x,
@@ -523,6 +615,11 @@ class AttentionAgent:
             'fixating': self.gaze.is_fixating,
             'saliency_left': saliency_left,
             'saliency_right': saliency_right,
+            # Nouvelles infos de zoom et attention
+            'zoom_level': self.current_zoom_level,
+            'zoom_scale': self.current_zoom_scale,
+            'effective_radius': self.effective_radius,
+            'num_pois': len(self.attention.memory.get_pois()),
         }
     
     def force_saccade_to(self, x: float, y: float):
@@ -692,12 +789,15 @@ def main():
     
     print("\n=== Agent Stéréo avec Attention ===")
     print("Mode AUTONOME activé - Les yeux cherchent les détails communs")
+    print("Zoom adaptatif et inhibition de retour activés")
     print("")
     print("Touches:")
     print("  a     Toggle autonome/manuel")
     print("  s     Saccade aléatoire")
-    print("  r     Reset au centre")
+    print("  r     Reset au centre (efface mémoire)")
     print("  d     Toggle disparité/corrélation")
+    print("  +/-   Zoom avant/arrière")
+    print("  i     Afficher statistiques attention")
     print("  q/ESC Quitter")
     print("  Clic  Saccade vers position")
     print("")
@@ -836,6 +936,15 @@ def main():
             cv2.putText(display, state_text, (display_w + 10, 25),
                        font, 0.5, (255, 255, 255), 1)
             
+            # Affichage du zoom et POIs
+            zoom_text = f"Zoom: {result['zoom_level']}/7 (x{result['zoom_scale']:.1f})"
+            cv2.putText(display, zoom_text, (display_w + 10, 45),
+                       font, 0.4, (200, 200, 100), 1)
+            
+            if result['num_pois'] > 0:
+                cv2.putText(display, f"POIs: {result['num_pois']}", 
+                           (display_w + 10, 65), font, 0.4, (100, 200, 100), 1)
+            
             # Historique de corrélation
             if len(agent.correlation_history) > 10:
                 avg_corr = np.mean(agent.correlation_history[-10:])
@@ -860,10 +969,25 @@ def main():
                 print("Saccade aléatoire!")
             elif key == ord('r'):
                 agent.reset()
-                print("Reset au centre")
+                agent.attention.reset()
+                print("Reset au centre (mémoire effacée)")
             elif key == ord('d'):
                 show_disparity = not show_disparity
                 print(f"Affichage: {'Disparité' if show_disparity else 'Corrélation'}")
+            elif key == ord('+') or key == ord('='):
+                agent.zoom_in()
+                print(f"Zoom IN → niveau {agent.current_zoom_level}, échelle {agent.current_zoom_scale:.2f}")
+            elif key == ord('-') or key == ord('_'):
+                agent.zoom_out()
+                print(f"Zoom OUT → niveau {agent.current_zoom_level}, échelle {agent.current_zoom_scale:.2f}")
+            elif key == ord('i'):
+                # Afficher les statistiques d'attention
+                stats = agent.attention.get_stats()
+                print(f"=== Statistiques Attention ===")
+                print(f"  POIs découverts: {stats['num_pois']}")
+                print(f"  Positions mémorisées: {stats['num_memories']}")
+                print(f"  Distance totale parcourue: {stats['total_distance']:.0f} px")
+                print(f"  Zoom: niveau {stats['zoom_level']}, échelle {stats['zoom_scale']:.2f}")
     
     except KeyboardInterrupt:
         print("\nInterruption...")
