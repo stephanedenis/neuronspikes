@@ -31,7 +31,11 @@ from numpy.typing import NDArray
 # Ajouter le chemin src pour l'import
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from neuronspikes import create_retina, RetinaLayer, GroupDetector, GroupDetectorConfig, visualize_groups
+from neuronspikes import (
+    create_retina, RetinaLayer, 
+    GroupDetector, GroupDetectorConfig, visualize_groups,
+    NeuronLayer, GenesisConfig, NeuronConfig, visualize_neurons,
+)
 from neuronspikes.temporal import TemporalCorrelator, CorrelationConfig, visualize_patterns
 
 
@@ -87,6 +91,23 @@ class RetinaVisualizer:
         )
         self._stable_pattern_count: int = 0
         
+        # Couche de neurones créés à partir des patterns stables
+        self.neuron_layer = NeuronLayer(
+            layer_id=1,
+            shape=(self.config.retina_height, self.config.retina_width),
+            config=GenesisConfig(
+                min_pattern_confidence=0.5,
+                min_pattern_occurrences=10,
+                max_neurons_per_layer=100,
+                prune_inactive_after=300  # 5 secondes à 60 fps
+            ),
+            neuron_config=NeuronConfig(
+                threshold=0.6,
+                decay_rate=0.15,
+                refractory_period=5
+            )
+        )
+        
         # Capture vidéo
         self.cap: cv2.VideoCapture | None = None
         
@@ -126,14 +147,14 @@ class RetinaVisualizer:
         print(f"✅ Caméra ouverte: {actual_width}x{actual_height} @ {actual_fps:.1f} fps")
         return True
     
-    def process_frame(self, frame: NDArray[np.uint8]) -> tuple[NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8]]:
+    def process_frame(self, frame: NDArray[np.uint8]) -> tuple[NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8]]:
         """Traite une frame et retourne l'entrée et les sorties.
         
         Args:
             frame: Image BGR de la caméra
             
         Returns:
-            Tuple (image_mono_resized, retina_output, groups_image, patterns_image)
+            Tuple (image_mono_resized, retina_output, groups_image, patterns_image, neurons_image)
         """
         # Convertir en niveaux de gris
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -167,15 +188,23 @@ class RetinaVisualizer:
         # Traiter les corrélations temporelles
         self.correlator.process_groups(groups)
         
+        # Créer des neurones à partir des nouveaux patterns stables
+        for pattern in self.correlator.stable_patterns:
+            self.neuron_layer.create_neuron_from_pattern(pattern)
+        
         # Créer l'image des patterns stables
         pattern_map = self.correlator.get_pattern_map()
         confidence_map = self.correlator.get_confidence_map()
         patterns_img = visualize_patterns(pattern_map, confidence_map)
         
-        # Stats patterns
+        # Traiter avec la couche de neurones
+        neuron_output = self.neuron_layer.process(activations)
+        neurons_img = visualize_neurons(self.neuron_layer, show_potentials=True)
+        
+        # Stats patterns et neurones
         self._stable_pattern_count = len(self.correlator.stable_patterns)
         
-        return gray_resized, retina_output, groups_img, patterns_img
+        return gray_resized, retina_output, groups_img, patterns_img, neurons_img
     
     def create_display(
         self, 
@@ -183,6 +212,7 @@ class RetinaVisualizer:
         retina_img: NDArray[np.uint8],
         groups_img: NDArray[np.uint8],
         patterns_img: NDArray[np.uint8],
+        neurons_img: NDArray[np.uint8],
         fps: float
     ) -> NDArray[np.uint8]:
         """Crée l'image d'affichage combinée.
@@ -192,13 +222,14 @@ class RetinaVisualizer:
             retina_img: Sortie de la rétine
             groups_img: Image des groupes d'activation (RGB)
             patterns_img: Image des patterns temporels (RGB)
+            neurons_img: Image des neurones (RGB)
             fps: FPS actuel
             
         Returns:
             Image combinée BGR pour affichage
         """
         # Taille d'affichage (upscale pour visibilité)
-        display_size = 256  # 4 panneaux de 256px = 1024px total
+        display_size = 200  # 5 panneaux de 200px = 1000px total
         
         # Upscale les images
         input_display = cv2.resize(
@@ -221,6 +252,11 @@ class RetinaVisualizer:
             (display_size, display_size), 
             interpolation=cv2.INTER_NEAREST
         )
+        neurons_display = cv2.resize(
+            neurons_img, 
+            (display_size, display_size), 
+            interpolation=cv2.INTER_NEAREST
+        )
         
         # Convertir en BGR pour l'affichage
         input_bgr = cv2.cvtColor(input_display, cv2.COLOR_GRAY2BGR)
@@ -228,29 +264,33 @@ class RetinaVisualizer:
         # Colormap pour la rétine (plus visuel)
         retina_colored = cv2.applyColorMap(retina_display, cv2.COLORMAP_INFERNO)
         
-        # Groupes et patterns: RGB -> BGR pour OpenCV
+        # Groupes, patterns et neurones: RGB -> BGR pour OpenCV
         groups_bgr = cv2.cvtColor(groups_display, cv2.COLOR_RGB2BGR)
         patterns_bgr = cv2.cvtColor(patterns_display, cv2.COLOR_RGB2BGR)
+        neurons_bgr = cv2.cvtColor(neurons_display, cv2.COLOR_RGB2BGR)
         
-        # Combiner horizontalement (4 panneaux)
-        combined = np.hstack([input_bgr, retina_colored, groups_bgr, patterns_bgr])
+        # Combiner horizontalement (5 panneaux)
+        combined = np.hstack([input_bgr, retina_colored, groups_bgr, patterns_bgr, neurons_bgr])
         
         # Ajouter les labels
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(combined, "ENTREE", (10, 25), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, "RETINE", (display_size + 10, 25), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, f"GROUPES ({self._last_groups_count})", (display_size * 2 + 10, 25), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, f"PATTERNS ({self._stable_pattern_count})", (display_size * 3 + 10, 25), font, 0.6, (255, 255, 255), 1)
+        neuron_count = self.neuron_layer.neuron_count
+        cv2.putText(combined, "ENTREE", (10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, "RETINE", (display_size + 10, 20), font, 0.5, (255, 255, 255), 1)
+        cv2.putText(combined, f"GROUPES ({self._last_groups_count})", (display_size * 2 + 5, 20), font, 0.4, (255, 255, 255), 1)
+        cv2.putText(combined, f"PATTERNS ({self._stable_pattern_count})", (display_size * 3 + 5, 20), font, 0.4, (255, 255, 255), 1)
+        cv2.putText(combined, f"NEURONES ({neuron_count})", (display_size * 4 + 5, 20), font, 0.4, (255, 255, 255), 1)
         
         if self.config.show_stats:
             # Stats en bas
             stats_y = display_size - 10
             correlator_stats = self.correlator.get_stats()
+            layer_stats = self.neuron_layer.get_stats()
             cv2.putText(
                 combined, 
-                f"FPS: {fps:.1f} | Frames: {self.frame_count} | Patterns actifs: {correlator_stats['active_patterns']}",
+                f"FPS: {fps:.1f} | F: {self.frame_count} | P: {correlator_stats['active_patterns']} | N: {neuron_count} | Spikes: {layer_stats['total_spikes']}",
                 (10, stats_y), 
-                font, 0.5, (0, 255, 0), 1
+                font, 0.4, (0, 255, 0), 1
             )
             
             # Afficher les stats de la rétine
@@ -325,8 +365,8 @@ class RetinaVisualizer:
                 # Sauvegarder la frame valide
                 self._last_valid_frame = frame.copy()
                 
-                # Traiter (retourne maintenant 4 images)
-                input_img, retina_img, groups_img, patterns_img = self.process_frame(frame)
+                # Traiter (retourne maintenant 5 images)
+                input_img, retina_img, groups_img, patterns_img, neurons_img = self.process_frame(frame)
                 self.frame_count += 1
                 
                 # Calculer FPS
@@ -340,8 +380,8 @@ class RetinaVisualizer:
                     fps = sum(self.fps_history) / len(self.fps_history)
                 last_time = current_time
                 
-                # Créer l'affichage (4 panneaux)
-                display = self.create_display(input_img, retina_img, groups_img, patterns_img, fps)
+                # Créer l'affichage (5 panneaux)
+                display = self.create_display(input_img, retina_img, groups_img, patterns_img, neurons_img, fps)
                 self._last_display = display  # Buffer pour éviter clignotement
                 
                 # Afficher
@@ -397,6 +437,13 @@ class RetinaVisualizer:
                 shape=(new_height, new_width),
                 config=self.correlator.config
             )
+            # Recréer la couche de neurones
+            self.neuron_layer = NeuronLayer(
+                layer_id=1,
+                shape=(new_height, new_width),
+                config=self.neuron_layer.config,
+                neuron_config=self.neuron_layer.neuron_config
+            )
             print(f"📐 Nouvelle résolution rétine: {new_width}x{new_height}")
     
     def cleanup(self):
@@ -409,17 +456,21 @@ class RetinaVisualizer:
         elapsed = time.time() - self.start_time
         avg_fps = self.frame_count / elapsed if elapsed > 0 else 0
         correlator_stats = self.correlator.get_stats()
+        layer_stats = self.neuron_layer.get_stats()
         
         print()
-        print("═" * 50)
+        print("═" * 60)
         print("Statistiques finales:")
         print(f"  • Durée: {elapsed:.1f} secondes")
         print(f"  • Frames traitées: {self.frame_count}")
         print(f"  • FPS moyen: {avg_fps:.1f}")
-        print(f"  • Impulsions totales: {self.retina.stats['total_spikes']:,}")
+        print(f"  • Impulsions rétine: {self.retina.stats['total_spikes']:,}")
         print(f"  • Patterns créés: {correlator_stats['total_created']}")
         print(f"  • Patterns stables: {correlator_stats['stable_patterns']}")
-        print("═" * 50)
+        print(f"  • Neurones créés: {layer_stats['total_created']}")
+        print(f"  • Neurones actifs: {layer_stats['neuron_count']}")
+        print(f"  • Spikes neurones: {layer_stats['total_spikes']}")
+        print("═" * 60)
 
 
 def main():
