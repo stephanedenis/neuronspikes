@@ -32,6 +32,7 @@ from numpy.typing import NDArray
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from neuronspikes import create_retina, RetinaLayer, GroupDetector, GroupDetectorConfig, visualize_groups
+from neuronspikes.temporal import TemporalCorrelator, CorrelationConfig, visualize_patterns
 
 
 @dataclass
@@ -44,6 +45,7 @@ class VisualizerConfig:
     target_fps: int = 60
     show_stats: bool = True
     show_groups: bool = True  # Afficher les groupes d'activation
+    show_patterns: bool = True  # Afficher les patterns temporels
     intensity_threshold: int = 200  # Seuil pour détecter les activations "fortes"
 
 
@@ -71,6 +73,19 @@ class RetinaVisualizer:
             connectivity=8,    # 8-connexité pour les diagonales
             track_history=10   # Garder 10 frames d'historique
         ))
+        
+        # Corrélateur temporel pour détecter les patterns récurrents
+        self.correlator = TemporalCorrelator(
+            shape=(self.config.retina_height, self.config.retina_width),
+            config=CorrelationConfig(
+                history_size=30,       # 0.5 seconde à 60 fps
+                min_overlap=0.5,       # 50% de chevauchement minimum
+                min_occurrences=5,     # Vu au moins 5 fois pour être stable
+                confidence_threshold=0.4,
+                decay_rate=0.95
+            )
+        )
+        self._stable_pattern_count: int = 0
         
         # Capture vidéo
         self.cap: cv2.VideoCapture | None = None
@@ -111,14 +126,14 @@ class RetinaVisualizer:
         print(f"✅ Caméra ouverte: {actual_width}x{actual_height} @ {actual_fps:.1f} fps")
         return True
     
-    def process_frame(self, frame: NDArray[np.uint8]) -> tuple[NDArray[np.uint8], NDArray[np.uint8]]:
-        """Traite une frame et retourne l'entrée et la sortie rétine.
+    def process_frame(self, frame: NDArray[np.uint8]) -> tuple[NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8], NDArray[np.uint8]]:
+        """Traite une frame et retourne l'entrée et les sorties.
         
         Args:
             frame: Image BGR de la caméra
             
         Returns:
-            Tuple (image_mono_resized, retina_output, groups_image)
+            Tuple (image_mono_resized, retina_output, groups_image, patterns_image)
         """
         # Convertir en niveaux de gris
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -149,13 +164,25 @@ class RetinaVisualizer:
         # Créer l'image des groupes
         groups_img = visualize_groups(activations, groups)
         
-        return gray_resized, retina_output, groups_img
+        # Traiter les corrélations temporelles
+        self.correlator.process_groups(groups)
+        
+        # Créer l'image des patterns stables
+        pattern_map = self.correlator.get_pattern_map()
+        confidence_map = self.correlator.get_confidence_map()
+        patterns_img = visualize_patterns(pattern_map, confidence_map)
+        
+        # Stats patterns
+        self._stable_pattern_count = len(self.correlator.stable_patterns)
+        
+        return gray_resized, retina_output, groups_img, patterns_img
     
     def create_display(
         self, 
         input_img: NDArray[np.uint8], 
         retina_img: NDArray[np.uint8],
         groups_img: NDArray[np.uint8],
+        patterns_img: NDArray[np.uint8],
         fps: float
     ) -> NDArray[np.uint8]:
         """Crée l'image d'affichage combinée.
@@ -164,13 +191,14 @@ class RetinaVisualizer:
             input_img: Image d'entrée monochrome
             retina_img: Sortie de la rétine
             groups_img: Image des groupes d'activation (RGB)
+            patterns_img: Image des patterns temporels (RGB)
             fps: FPS actuel
             
         Returns:
             Image combinée BGR pour affichage
         """
         # Taille d'affichage (upscale pour visibilité)
-        display_size = 320  # Réduit pour 3 panneaux
+        display_size = 256  # 4 panneaux de 256px = 1024px total
         
         # Upscale les images
         input_display = cv2.resize(
@@ -188,6 +216,11 @@ class RetinaVisualizer:
             (display_size, display_size), 
             interpolation=cv2.INTER_NEAREST
         )
+        patterns_display = cv2.resize(
+            patterns_img, 
+            (display_size, display_size), 
+            interpolation=cv2.INTER_NEAREST
+        )
         
         # Convertir en BGR pour l'affichage
         input_bgr = cv2.cvtColor(input_display, cv2.COLOR_GRAY2BGR)
@@ -195,25 +228,27 @@ class RetinaVisualizer:
         # Colormap pour la rétine (plus visuel)
         retina_colored = cv2.applyColorMap(retina_display, cv2.COLORMAP_INFERNO)
         
-        # Groupes: RGB -> BGR pour OpenCV
-        groups_bgr = cv2.cvtColor(groups_img, cv2.COLOR_RGB2BGR)
-        groups_bgr = cv2.resize(groups_bgr, (display_size, display_size), interpolation=cv2.INTER_NEAREST)
+        # Groupes et patterns: RGB -> BGR pour OpenCV
+        groups_bgr = cv2.cvtColor(groups_display, cv2.COLOR_RGB2BGR)
+        patterns_bgr = cv2.cvtColor(patterns_display, cv2.COLOR_RGB2BGR)
         
-        # Combiner horizontalement (3 panneaux)
-        combined = np.hstack([input_bgr, retina_colored, groups_bgr])
+        # Combiner horizontalement (4 panneaux)
+        combined = np.hstack([input_bgr, retina_colored, groups_bgr, patterns_bgr])
         
         # Ajouter les labels
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(combined, "ENTREE", (10, 25), font, 0.6, (255, 255, 255), 1)
         cv2.putText(combined, "RETINE", (display_size + 10, 25), font, 0.6, (255, 255, 255), 1)
         cv2.putText(combined, f"GROUPES ({self._last_groups_count})", (display_size * 2 + 10, 25), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, f"PATTERNS ({self._stable_pattern_count})", (display_size * 3 + 10, 25), font, 0.6, (255, 255, 255), 1)
         
         if self.config.show_stats:
             # Stats en bas
             stats_y = display_size - 10
+            correlator_stats = self.correlator.get_stats()
             cv2.putText(
                 combined, 
-                f"FPS: {fps:.1f} | Frames: {self.frame_count}",
+                f"FPS: {fps:.1f} | Frames: {self.frame_count} | Patterns actifs: {correlator_stats['active_patterns']}",
                 (10, stats_y), 
                 font, 0.5, (0, 255, 0), 1
             )
@@ -290,8 +325,8 @@ class RetinaVisualizer:
                 # Sauvegarder la frame valide
                 self._last_valid_frame = frame.copy()
                 
-                # Traiter (retourne maintenant 3 images)
-                input_img, retina_img, groups_img = self.process_frame(frame)
+                # Traiter (retourne maintenant 4 images)
+                input_img, retina_img, groups_img, patterns_img = self.process_frame(frame)
                 self.frame_count += 1
                 
                 # Calculer FPS
@@ -305,8 +340,8 @@ class RetinaVisualizer:
                     fps = sum(self.fps_history) / len(self.fps_history)
                 last_time = current_time
                 
-                # Créer l'affichage (3 panneaux)
-                display = self.create_display(input_img, retina_img, groups_img, fps)
+                # Créer l'affichage (4 panneaux)
+                display = self.create_display(input_img, retina_img, groups_img, patterns_img, fps)
                 self._last_display = display  # Buffer pour éviter clignotement
                 
                 # Afficher
@@ -357,6 +392,11 @@ class RetinaVisualizer:
                 height=new_height,
                 fps=self.config.target_fps
             )
+            # Recréer le corrélateur avec les nouvelles dimensions
+            self.correlator = TemporalCorrelator(
+                shape=(new_height, new_width),
+                config=self.correlator.config
+            )
             print(f"📐 Nouvelle résolution rétine: {new_width}x{new_height}")
     
     def cleanup(self):
@@ -368,6 +408,7 @@ class RetinaVisualizer:
         # Afficher les stats finales
         elapsed = time.time() - self.start_time
         avg_fps = self.frame_count / elapsed if elapsed > 0 else 0
+        correlator_stats = self.correlator.get_stats()
         
         print()
         print("═" * 50)
@@ -376,6 +417,8 @@ class RetinaVisualizer:
         print(f"  • Frames traitées: {self.frame_count}")
         print(f"  • FPS moyen: {avg_fps:.1f}")
         print(f"  • Impulsions totales: {self.retina.stats['total_spikes']:,}")
+        print(f"  • Patterns créés: {correlator_stats['total_created']}")
+        print(f"  • Patterns stables: {correlator_stats['stable_patterns']}")
         print("═" * 50)
 
 
