@@ -46,6 +46,8 @@ from neuronspikes import (
     Fovea,
     FoveaConfig,
     visualize_fovea,
+    get_opencl_backend,
+    is_opencl_available,
 )
 
 
@@ -154,6 +156,7 @@ class AttentionAgent:
     """Agent d'attention visuelle binoculaire.
     
     Cherche activement les détails communs entre les deux yeux.
+    Utilise OpenCL pour accélérer le traitement GPU si disponible.
     """
     
     def __init__(
@@ -161,10 +164,22 @@ class AttentionAgent:
         frame_width: int,
         frame_height: int,
         fovea_config: FoveaConfig,
+        use_opencl: bool = True,
     ):
         self.width = frame_width
         self.height = frame_height
         self.config = fovea_config
+        
+        # Backend OpenCL (optionnel)
+        self.opencl = None
+        if use_opencl and is_opencl_available():
+            try:
+                self.opencl = get_opencl_backend(prefer_amd=True, verbose=True)
+                # Pré-calculer les paramètres des cellules pour OpenCL
+                self._build_cell_params()
+            except Exception as e:
+                print(f"OpenCL désactivé: {e}")
+                self.opencl = None
         
         # Deux fovéas indépendantes
         self.left_fovea = Fovea(fovea_config)
@@ -202,6 +217,39 @@ class AttentionAgent:
         
         # Statistiques
         self.correlation_history: List[float] = []
+        self.gpu_time_ms: float = 0.0
+    
+    def _build_cell_params(self):
+        """Pré-calcule les paramètres des cellules pour OpenCL."""
+        cfg = self.config
+        num_cells = cfg.num_rings * cfg.num_sectors
+        self.cell_params = np.zeros(num_cells * 4, dtype=np.float32)
+        
+        # Recalculer les rayons comme dans Fovea._build_cells()
+        radii = [0.0]
+        for i in range(cfg.num_rings):
+            if i < cfg.num_rings // 4:
+                r = cfg.fovea_radius * (i + 1) / (cfg.num_rings // 4)
+            else:
+                t = (i - cfg.num_rings // 4) / (cfg.num_rings * 0.75)
+                r = cfg.fovea_radius + (cfg.max_radius - cfg.fovea_radius) * (t ** 1.5)
+            radii.append(min(r, cfg.max_radius))
+        
+        sector_angle = 2 * math.pi / cfg.num_sectors
+        
+        idx = 0
+        for ring_idx in range(cfg.num_rings):
+            inner_r = radii[ring_idx]
+            outer_r = radii[ring_idx + 1]
+            for sector_idx in range(cfg.num_sectors):
+                start_angle = sector_idx * sector_angle
+                end_angle = (sector_idx + 1) * sector_angle
+                
+                self.cell_params[idx * 4 + 0] = inner_r
+                self.cell_params[idx * 4 + 1] = outer_r
+                self.cell_params[idx * 4 + 2] = start_angle
+                self.cell_params[idx * 4 + 3] = end_angle
+                idx += 1
     
     def compute_saliency_map(
         self, 
@@ -217,6 +265,25 @@ class AttentionAgent:
         Returns:
             Carte de saillance normalisée
         """
+        import time
+        start_time = time.perf_counter()
+        
+        # Essayer OpenCL si disponible
+        if self.opencl is not None:
+            try:
+                # Redimensionner d'abord pour le GPU (plus efficace)
+                gray_small = cv2.resize(gray, (160, 120))
+                prev_small = cv2.resize(prev_gray, (160, 120)) if prev_gray is not None else None
+                
+                saliency = self.opencl.compute_saliency(gray_small, prev_small)
+                saliency_out = cv2.resize(saliency, (64, 48))
+                
+                self.gpu_time_ms = (time.perf_counter() - start_time) * 1000
+                return saliency_out
+            except Exception as e:
+                print(f"OpenCL saliency fallback: {e}")
+        
+        # Fallback CPU
         # Saillance par contraste (gradient)
         grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -237,6 +304,7 @@ class AttentionAgent:
         # Réduire la résolution pour accélérer
         saliency_small = cv2.resize(saliency, (64, 48))
         
+        self.gpu_time_ms = (time.perf_counter() - start_time) * 1000
         return saliency_small
     
     def find_saliency_peaks(
@@ -293,6 +361,14 @@ class AttentionAgent:
         Returns:
             Score de corrélation (0-1)
         """
+        # Essayer OpenCL si disponible
+        if self.opencl is not None:
+            try:
+                return self.opencl.stereo_correlation(left_act, right_act)
+            except Exception:
+                pass  # Fallback CPU silencieux
+        
+        # CPU fallback
         # Normaliser
         left_norm = left_act / (np.linalg.norm(left_act) + 1e-6)
         right_norm = right_act / (np.linalg.norm(right_act) + 1e-6)
@@ -382,9 +458,32 @@ class AttentionAgent:
         self.left_fovea.set_gaze(gaze_x + vergence_offset, gaze_y)
         self.right_fovea.set_gaze(gaze_x - vergence_offset, gaze_y)
         
-        # Échantillonner avec les fovéas
-        left_act = self.left_fovea.sample(left_gray)
-        right_act = self.right_fovea.sample(right_gray)
+        # Échantillonner avec les fovéas (GPU si disponible)
+        if self.opencl is not None:
+            try:
+                left_act = self.opencl.polar_sample(
+                    left_gray, 
+                    int(gaze_x + vergence_offset), 
+                    int(gaze_y),
+                    self.cell_params,
+                    self.config.num_rings,
+                    self.config.num_sectors
+                )
+                right_act = self.opencl.polar_sample(
+                    right_gray,
+                    int(gaze_x - vergence_offset),
+                    int(gaze_y),
+                    self.cell_params,
+                    self.config.num_rings,
+                    self.config.num_sectors
+                )
+            except Exception as e:
+                # Fallback CPU
+                left_act = self.left_fovea.sample(left_gray)
+                right_act = self.right_fovea.sample(right_gray)
+        else:
+            left_act = self.left_fovea.sample(left_gray)
+            right_act = self.right_fovea.sample(right_gray)
         
         # Calculer la corrélation stéréo
         correlation = self.compute_stereo_correlation(left_act, right_act)
@@ -711,8 +810,16 @@ def main():
             mode_color = (0, 255, 0) if agent.autonomous else (0, 165, 255)
             cv2.putText(display, f"Mode: {mode_text}", (display_w - 120, 25), 
                        font, 0.5, mode_color, 1)
-            cv2.putText(display, f"FPS: {fps:.1f}", (10, display_h - 10),
+            
+            # Affichage FPS et GPU
+            gpu_info = "GPU" if agent.opencl else "CPU"
+            cv2.putText(display, f"FPS: {fps:.1f} [{gpu_info}]", (10, display_h - 10),
                        font, 0.5, (0, 255, 0), 1)
+            
+            # Temps GPU si disponible
+            if agent.gpu_time_ms > 0:
+                cv2.putText(display, f"Saliency: {agent.gpu_time_ms:.1f}ms", 
+                           (10, display_h - 25), font, 0.4, (180, 180, 180), 1)
             
             state_text = "SACCADE" if result['in_saccade'] else ("FIXATION" if result['fixating'] else "POURSUITE")
             cv2.putText(display, state_text, (display_w + 10, 25),
