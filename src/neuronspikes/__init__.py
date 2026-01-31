@@ -42,6 +42,13 @@ __all__ = [
     "FabricConfig",
     "LearningCapability",
     "Cortex",
+    # Fovéa polaire
+    "Fovea",
+    "FoveaConfig",
+    "GazePoint",
+    "PolarCell",
+    "StereoFovea",
+    "visualize_fovea",
 ]
 
 from .model import SpikingModel
@@ -52,3 +59,4 @@ from .temporal import TemporalPattern, TemporalCorrelator, CorrelationConfig, vi
 from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConfig, visualize_neurons
 from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
 from .fabric import Fabric, FabricConfig, LearningCapability, Cortex
+from .fovea import Fovea, FoveaConfig, GazePoint, PolarCell, StereoFovea, visualize_fovea
