@@ -152,5 +152,257 @@ les corrélations entre les patterns d'activation dans le temps.
 
 ---
 
+## 2026-01-31 - Module Fovéa Bio-inspirée
+
+### Concept: Fovéa Polaire
+
+Implémentation d'une rétine fovéale inspirée de l'anatomie de l'œil humain:
+- **Zone fovéale** (centre): Haute résolution, cellules petites et denses
+- **Zone périphérique**: Basse résolution, cellules grandes et éparses
+- **Grille polaire**: Organisation en anneaux concentriques et secteurs angulaires
+
+#### Architecture `fovea.py`
+
+| Classe | Description |
+|--------|-------------|
+| `FoveaConfig` | Configuration (num_rings, num_sectors, fovea_radius, max_radius) |
+| `GazePoint` | Point de regard avec contraintes de mouvement |
+| `PolarCell` | Cellule polaire (ring, sector, inner/outer radius, angles) |
+| `Fovea` | Rétine fovéale avec échantillonnage polaire |
+| `StereoFovea` | Paire de fovéas pour vision stéréoscopique |
+| `visualize_fovea()` | Visualisation de la grille polaire |
+
+#### Formule de Distribution des Rayons
+
+Les cellules suivent une distribution log-polaire:
+- **Zone fovéale** (25% internes): Distribution linéaire dense
+- **Zone périphérique** (75% externes): Distribution exponentielle (t^1.5)
+
+```python
+if ring_idx < num_rings // 4:
+    r = fovea_radius * (ring_idx + 1) / (num_rings // 4)
+else:
+    t = (ring_idx - num_rings // 4) / (num_rings * 0.75)
+    r = fovea_radius + (max_radius - fovea_radius) * (t ** 1.5)
+```
+
+#### Tests
+- 40 tests unitaires dans `tests/test_fovea.py`
+- Couverture: construction, échantillonnage, stéréo, visualisation
+
+---
+
+## 2026-01-31 - Caméra Stéréoscopique
+
+### Détection Hardware
+
+Caméra stéréo **Gearway SPCA2100** détectée sur `/dev/video1`:
+
+| Paramètre | Valeur |
+|-----------|--------|
+| Bus USB | 001 |
+| Mode | Side-by-side (une image double largeur) |
+| Résolution max | 2560×720 (1280×720 par œil) |
+| Résolution standard | 1280×480 (640×480 par œil) |
+| Format | MJPG, YUYV |
+
+**Note**: Microsoft LifeCam VX-3000 sur `/dev/video0` (mono, 640×480).
+
+### Implémentation `live_stereo.py`
+
+Premier visualiseur stéréo simple:
+- Séparation automatique gauche/droite
+- Affichage des deux fovéas
+- Calcul de corrélation entre les activations
+
+---
+
+## 2026-01-31 - Agent Stéréo Autonome
+
+### Concept: "Yeux mobiles qui cherchent les détails communs"
+
+Création de `live_stereo_agent.py` - un agent d'attention visuelle binoculaire
+qui déplace activement son regard vers les zones de forte saillance.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AttentionAgent                            │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │ Left Fovea  │  │ Right Fovea │  │  GazeController     │ │
+│  │ (polaire)   │  │ (polaire)   │  │ - Saccades          │ │
+│  │             │  │             │  │ - Poursuite         │ │
+│  │ vergence +5 │  │ vergence -5 │  │ - Fixation          │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+├─────────────────────────────────────────────────────────────┤
+│  Saliency Map (gradient + mouvement) → SaliencyPeaks        │
+│  Stereo Correlation → Score de confiance (0-1)              │
+├─────────────────────────────────────────────────────────────┤
+│  Decision: Si corrélation < 0.3 → Saccade vers pic saillant │
+│            Si fixation > 15 frames → Explorer                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### États du Regard (GazeController)
+
+| État | Vitesse | Déclencheur |
+|------|---------|-------------|
+| **Saccade** | Rapide (0.3) | Nouvelle cible, faible corrélation |
+| **Poursuite** | Moyenne (0.15) | Suivi d'objet en mouvement |
+| **Fixation** | Stable | Distance < 2px pendant 5+ frames |
+
+#### Configuration Fovéa (Optimisée pour Performance)
+
+```python
+FoveaConfig(
+    num_rings=8,       # Anneaux (réduit pour rapidité)
+    num_sectors=8,     # Secteurs (réduit pour rapidité)
+    fovea_radius=16,   # Zone centrale: 16px
+    max_radius=64,     # Rayon total: 64px (diamètre 128px)
+)
+```
+
+#### Contrôles Interactifs
+
+| Touche | Action |
+|--------|--------|
+| `a` | Toggle autonome/manuel |
+| `s` | Saccade aléatoire |
+| `r` | Reset au centre |
+| `d` | Toggle affichage disparité |
+| `q`/`ESC` | Quitter |
+| **Clic souris** | Saccade vers position |
+
+---
+
+## 2026-01-31 - Backend OpenCL (GPU)
+
+### Motivation
+
+> *"On commence à sentir le besoin d'OpenCL"*
+
+Le traitement temps réel (2×1280×720 à 30+ FPS) nécessite l'accélération GPU.
+
+### Implémentation `opencl_backend.py`
+
+Backend OpenCL avec détection automatique du meilleur GPU:
+- **Préférence AMD** (rusticl/Mesa plus stable que NVIDIA sous Linux)
+- **Fallback NVIDIA** si AMD non disponible
+
+#### Kernels OpenCL Implémentés
+
+| Kernel | Description | Performance |
+|--------|-------------|-------------|
+| `polar_sample` | Échantillonnage polaire accéléré | ~2.4 ms |
+| `compute_saliency` | Gradient Sobel (contraste) | ~4.9 ms |
+| `abs_diff` | Différence absolue (mouvement) | ~0.8 ms |
+| `stereo_correlation` | Corrélation + disparité stéréo | ~0.76 ms |
+| `detect_rotation` | Détection rotation (VOR) | ~0.5 ms |
+
+#### Benchmark (AMD RX 480, 160×120)
+
+```
+polar_sample:      2.38 ± 0.02 ms
+compute_saliency:  4.93 ± 0.09 ms
+abs_diff:          0.78 ± 0.01 ms
+stereo_correlation: 0.76 ± 0.01 ms
+detect_rotation:   0.49 ± 0.01 ms
+```
+
+#### Tests
+- 16 tests unitaires dans `tests/test_opencl.py`
+- Validation numérique CPU vs GPU
+
+### Intégration dans l'Agent Stéréo
+
+Modifications de `live_stereo_agent.py`:
+
+1. **Initialisation OpenCL** dans `AttentionAgent.__init__`:
+   ```python
+   if use_opencl and is_opencl_available():
+       self.opencl = get_opencl_backend(prefer_amd=True, verbose=True)
+       self._build_cell_params()  # Pré-calcul pour GPU
+   ```
+
+2. **compute_saliency_map()** → GPU:
+   ```python
+   saliency = self.opencl.compute_saliency(gray_small)
+   if prev_gray is not None:
+       motion = self.opencl.abs_diff(gray_small, prev_small)
+       saliency = saliency * 0.6 + motion * 0.4
+   ```
+
+3. **compute_stereo_correlation()** → GPU:
+   ```python
+   corr_arr, _ = self.opencl.stereo_correlation(left_act, right_act)
+   return float(np.mean(np.clip(corr_arr, 0, 1)))
+   ```
+
+4. **Échantillonnage polaire** → GPU:
+   ```python
+   left_act = self.opencl.polar_sample(left_gray, gaze_x+5, gaze_y, ...)
+   right_act = self.opencl.polar_sample(right_gray, gaze_x-5, gaze_y, ...)
+   ```
+
+5. **Affichage enrichi**:
+   - Indicateur `[GPU]` ou `[CPU]` à côté du FPS
+   - Temps de calcul saliency en millisecondes
+
+### Gain de Performance Estimé
+
+| Opération | CPU | GPU | Speedup |
+|-----------|-----|-----|---------|
+| Saliency | ~15 ms | ~5 ms | 3× |
+| Polar sample | ~8 ms | ~2.5 ms | 3× |
+| Correlation | ~2 ms | ~0.8 ms | 2.5× |
+| **Total frame** | ~50 ms | ~15 ms | **3.3×** |
+
+---
+
+## Statistiques du Projet
+
+### Tests Unitaires
+
+| Module | Tests |
+|--------|-------|
+| lut.py | 12 |
+| retina.py | 28 |
+| groups.py | 28 |
+| synapses.py | 24 |
+| temporal.py | 22 |
+| genesis.py | 30 |
+| fovea.py | 40 |
+| opencl_backend.py | 16 |
+| **Total** | **210** |
+
+### Structure du Code
+
+```
+src/neuronspikes/
+├── __init__.py          # Exports publics
+├── lut.py               # Tables de lookup (bit-reversal)
+├── retina.py            # Rétine cartésienne
+├── groups.py            # Détection de groupes d'activation
+├── synapses.py          # Connexions synaptiques Hebbiennes
+├── temporal.py          # Corrélation temporelle
+├── genesis.py           # Genèse de nouveaux neurones
+├── fovea.py             # Rétine fovéale polaire
+└── opencl_backend.py    # Accélération GPU
+
+examples/
+├── live_retina.py       # Visualiseur rétine mono
+├── live_stereo.py       # Visualiseur stéréo simple
+└── live_stereo_agent.py # Agent stéréo autonome
+```
+
+### Dépôt GitHub
+
+- **URL**: https://github.com/stephanedenis/neuronspikes
+- **Branche principale**: main
+- **Licence**: MIT
+
+---
+
 *Journal maintenu automatiquement - Chaque commit contient une entrée détaillée*
 

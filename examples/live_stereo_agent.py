@@ -273,9 +273,17 @@ class AttentionAgent:
             try:
                 # Redimensionner d'abord pour le GPU (plus efficace)
                 gray_small = cv2.resize(gray, (160, 120))
-                prev_small = cv2.resize(prev_gray, (160, 120)) if prev_gray is not None else None
                 
-                saliency = self.opencl.compute_saliency(gray_small, prev_small)
+                # Saillance par gradient (contraste)
+                saliency = self.opencl.compute_saliency(gray_small)
+                
+                # Ajouter mouvement si image précédente disponible
+                if prev_gray is not None:
+                    prev_small = cv2.resize(prev_gray, (160, 120))
+                    motion = self.opencl.abs_diff(gray_small, prev_small)
+                    # Combiner gradient (60%) + mouvement (40%)
+                    saliency = saliency * 0.6 + motion * 0.4
+                
                 saliency_out = cv2.resize(saliency, (64, 48))
                 
                 self.gpu_time_ms = (time.perf_counter() - start_time) * 1000
@@ -364,7 +372,10 @@ class AttentionAgent:
         # Essayer OpenCL si disponible
         if self.opencl is not None:
             try:
-                return self.opencl.stereo_correlation(left_act, right_act)
+                # stereo_correlation retourne (correlation_array, disparity_array)
+                corr_arr, _ = self.opencl.stereo_correlation(left_act, right_act)
+                # Moyenne des corrélations pour obtenir un score global
+                return float(np.mean(np.clip(corr_arr, 0, 1)))
             except Exception:
                 pass  # Fallback CPU silencieux
         
