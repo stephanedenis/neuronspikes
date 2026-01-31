@@ -49,6 +49,11 @@ __all__ = [
     "PolarCell",
     "StereoFovea",
     "visualize_fovea",
+    # OpenCL Backend
+    "OpenCLBackend",
+    "get_opencl_backend",
+    "is_opencl_available",
+    "list_opencl_devices",
 ]
 
 from .model import SpikingModel
@@ -60,3 +65,4 @@ from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConf
 from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
 from .fabric import Fabric, FabricConfig, LearningCapability, Cortex
 from .fovea import Fovea, FoveaConfig, GazePoint, PolarCell, StereoFovea, visualize_fovea
+from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices
