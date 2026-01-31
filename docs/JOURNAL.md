@@ -99,12 +99,44 @@ dans la fenêtre temporelle plutôt que concentrées au début ou à la fin.
 
 ### Prochaines Étapes
 
-1. [ ] Implémenter la LUT d'inversion de bits
-2. [ ] Créer la structure de données pour les neurones de rétine
-3. [ ] Implémenter le mécanisme d'accumulation de charge
-4. [ ] Créer le système de frames d'activation
+1. [x] Implémenter la LUT d'inversion de bits
+2. [x] Créer la structure de données pour les neurones de rétine
+3. [x] Implémenter le mécanisme d'accumulation de charge
+4. [x] Créer le système de frames d'activation
 5. [ ] Intégrer OpenCL pour l'accélération GPU (RX 480)
-6. [ ] Connecter une source caméra
+6. [x] Connecter une source caméra
+
+---
+
+## 2026-01-31 - Visualiseur Rétine Temps Réel
+
+### Implémentation `live_retina.py`
+
+Création d'un visualiseur temps réel qui affiche côte à côte:
+- **Gauche**: Image source de la caméra (monochrome)
+- **Droite**: Sortie de la rétine (colormap INFERNO)
+
+L'intensité affichée à droite correspond au cumul d'activations par pixel
+pour la frame courante (équivalent direct à l'intensité du pixel source,
+car le pattern d'activation encode exactement cette intensité).
+
+#### Fonctionnalités
+- Capture caméra en temps réel (640x480 → rétine 128x128)
+- Contrôles interactifs:
+  - `q`/`ESC`: Quitter
+  - `s`: Sauvegarder capture
+  - `r`: Reset statistiques
+  - `+`/`-`: Ajuster résolution (32-512)
+- Affichage stats: FPS, frames, résolution, impulsions totales
+
+#### Observation
+
+La rétine reproduit fidèlement l'image source. C'est attendu puisque
+`get_activation_pattern()` retourne le nombre d'impulsions par pixel,
+qui correspond exactement à l'intensité.
+
+**La vraie valeur viendra avec les couches suivantes** qui détecteront
+les corrélations entre les patterns d'activation dans le temps.
 
 ---
 
@@ -121,3 +153,4 @@ dans la fenêtre temporelle plutôt que concentrées au début ou à la fin.
 ---
 
 *Journal maintenu automatiquement - Chaque commit contient une entrée détaillée*
+
