@@ -31,6 +31,12 @@ __all__ = [
     "NeuronLayer",
     "GenesisConfig",
     "visualize_neurons",
+    # Synapses et apprentissage Hebbien
+    "Synapse",
+    "SynapseType",
+    "SynapticConfig",
+    "SynapticNetwork",
+    "HebbianLayer",
 ]
 
 from .model import SpikingModel
@@ -39,3 +45,4 @@ from .lut import BIT_REVERSAL_LUT, INTENSITY_TO_SPIKES
 from .groups import GroupDetector, GroupDetectorConfig, ActivationGroup, visualize_groups
 from .temporal import TemporalPattern, TemporalCorrelator, CorrelationConfig, visualize_patterns
 from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConfig, visualize_neurons
+from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
