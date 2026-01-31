@@ -59,6 +59,14 @@ __all__ = [
     "AttentionController",
     "GazeMemory",
     "PointOfInterest",
+    # Fovéa couleur et mouvement
+    "ColorChannel",
+    "ColorFoveaConfig",
+    "MotionVector",
+    "TrackedObject",
+    "ColorFovea",
+    "ObjectTracker",
+    "visualize_color_fovea",
     # OpenCL Backend
     "OpenCLBackend",
     "get_opencl_backend",
@@ -79,5 +87,9 @@ from .attention import (
     ZoomConfig, ZoomLevel, AttentionConfig, VirtualZoom,
     InhibitionMap, AttentionMemory, AttentionController,
     GazeMemory, PointOfInterest
+)
+from .color_fovea import (
+    ColorChannel, ColorFoveaConfig, MotionVector,
+    TrackedObject, ColorFovea, ObjectTracker, visualize_color_fovea
 )
 from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices

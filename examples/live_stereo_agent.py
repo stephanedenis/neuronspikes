@@ -52,6 +52,9 @@ from neuronspikes import (
     AttentionController,
     AttentionConfig,
     ZoomConfig,
+    # Fovéa couleur avec mouvement
+    ColorFovea,
+    ColorFoveaConfig,
 )
 
 
@@ -162,6 +165,7 @@ class AttentionAgent:
     Cherche activement les détails communs entre les deux yeux.
     Utilise OpenCL pour accélérer le traitement GPU si disponible.
     Intègre zoom virtuel, mémoire des positions et rétroaction inhibitrice.
+    Supporte le mode couleur avec ColorFovea pour détection de mouvement.
     """
     
     def __init__(
@@ -170,10 +174,12 @@ class AttentionAgent:
         frame_height: int,
         fovea_config: FoveaConfig,
         use_opencl: bool = True,
+        use_color: bool = False,
     ):
         self.width = frame_width
         self.height = frame_height
         self.config = fovea_config
+        self.use_color = use_color
         
         # Backend OpenCL (optionnel)
         self.opencl = None
@@ -208,9 +214,24 @@ class AttentionAgent:
             attention_config=attention_cfg
         )
         
-        # Deux fovéas indépendantes
-        self.left_fovea = Fovea(fovea_config)
-        self.right_fovea = Fovea(fovea_config)
+        # Deux fovéas indépendantes (couleur ou grayscale)
+        if use_color:
+            color_config = ColorFoveaConfig(
+                num_rings=fovea_config.num_rings,
+                num_sectors=fovea_config.num_sectors,
+                fovea_radius=fovea_config.fovea_radius,
+                max_radius=fovea_config.max_radius,
+                use_color=True,
+                motion_history=5,
+                motion_threshold=2.0,
+            )
+            self.left_fovea = ColorFovea(color_config)
+            self.right_fovea = ColorFovea(color_config)
+            self.color_config = color_config
+        else:
+            self.left_fovea = Fovea(fovea_config)
+            self.right_fovea = Fovea(fovea_config)
+            self.color_config = None
         
         # Contrôleur de regard (commun aux deux yeux, légère vergence)
         center_x = frame_width // 2
@@ -510,13 +531,17 @@ class AttentionAgent:
     def process(
         self,
         left_gray: np.ndarray,
-        right_gray: np.ndarray
+        right_gray: np.ndarray,
+        left_color: np.ndarray = None,
+        right_color: np.ndarray = None
     ) -> dict:
         """Traite une paire d'images stéréo.
         
         Args:
             left_gray: Image gauche en grayscale
             right_gray: Image droite en grayscale
+            left_color: Image gauche BGR (optionnel, pour mode couleur)
+            right_color: Image droite BGR (optionnel, pour mode couleur)
             
         Returns:
             Dictionnaire avec les résultats
@@ -548,8 +573,26 @@ class AttentionAgent:
         self.left_fovea.set_gaze(gaze_x + vergence_offset, gaze_y)
         self.right_fovea.set_gaze(gaze_x - vergence_offset, gaze_y)
         
-        # Échantillonner avec les fovéas (GPU si disponible)
-        if self.opencl is not None:
+        # Variables pour les résultats couleur
+        left_color_data = None
+        right_color_data = None
+        left_motion = None
+        right_motion = None
+        
+        # Échantillonner avec les fovéas
+        if self.use_color and left_color is not None and right_color is not None:
+            # Mode couleur: échantillonner avec ColorFovea
+            left_color_data = self.left_fovea.sample_color(left_color)
+            right_color_data = self.right_fovea.sample_color(right_color)
+            
+            # Extraire luma pour la corrélation stéréo
+            left_act = left_color_data['luma']
+            right_act = right_color_data['luma']
+            
+            # Récupérer les infos de mouvement
+            left_motion = self.left_fovea.get_dominant_motion()
+            right_motion = self.right_fovea.get_dominant_motion()
+        elif self.opencl is not None:
             try:
                 left_act = self.opencl.polar_sample(
                     left_gray, 
@@ -620,6 +663,11 @@ class AttentionAgent:
             'zoom_scale': self.current_zoom_scale,
             'effective_radius': self.effective_radius,
             'num_pois': len(self.attention.memory.get_pois()),
+            # Infos couleur et mouvement (si mode couleur)
+            'left_color_data': left_color_data,
+            'right_color_data': right_color_data,
+            'left_motion': left_motion,
+            'right_motion': right_motion,
         }
     
     def force_saccade_to(self, x: float, y: float):
@@ -756,6 +804,8 @@ def main():
                         help='Nombre d\'anneaux (défaut: 8 pour rapidité)')
     parser.add_argument('-s', '--sectors', type=int, default=8,
                         help='Nombre de secteurs (défaut: 8 pour rapidité)')
+    parser.add_argument('--color', action='store_true',
+                        help='Mode couleur avec détection de mouvement (ColorFovea)')
     args = parser.parse_args()
     
     # Initialiser la caméra
@@ -779,6 +829,7 @@ def main():
         frame_width=camera.half_width,
         frame_height=camera.height,
         fovea_config=config,
+        use_color=args.color,
     )
     
     # État
@@ -835,8 +886,14 @@ def main():
             left_gray = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
             right_gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
             
-            # Traitement par l'agent
-            result = agent.process(left_gray, right_gray)
+            # Traitement par l'agent (avec couleur si mode activé)
+            if args.color:
+                result = agent.process(
+                    left_gray, right_gray,
+                    left_color=left, right_color=right
+                )
+            else:
+                result = agent.process(left_gray, right_gray)
             
             frame_count += 1
             elapsed = time.time() - start_time
@@ -944,6 +1001,21 @@ def main():
             if result['num_pois'] > 0:
                 cv2.putText(display, f"POIs: {result['num_pois']}", 
                            (display_w + 10, 65), font, 0.4, (100, 200, 100), 1)
+            
+            # Affichage infos couleur et mouvement (si mode couleur)
+            if args.color and result['left_motion'] is not None:
+                motion = result['left_motion']
+                motion_text = f"Motion: {motion.magnitude:.1f}px @{math.degrees(motion.direction):.0f}°"
+                cv2.putText(display, motion_text, (display_w + 10, 85),
+                           font, 0.4, (100, 150, 255), 1)
+            elif args.color:
+                cv2.putText(display, "Motion: --", (display_w + 10, 85),
+                           font, 0.4, (100, 150, 255), 1)
+            
+            # Indicateur mode couleur
+            if args.color:
+                cv2.putText(display, "COLOR", (display_w - 100, display_h - 10),
+                           font, 0.5, (100, 200, 255), 1)
             
             # Historique de corrélation
             if len(agent.correlation_history) > 10:
