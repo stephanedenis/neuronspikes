@@ -360,6 +360,78 @@ Modifications de `live_stereo_agent.py`:
 
 ---
 
+## 2026-01-31 - Module ColorFovea (Vision Couleur et Mouvement)
+
+### Concept: Fovéa avec Couleur, Alpha et Mouvement
+
+Extension de la fovéa polaire avec des capacités de vision couleur et détection de mouvement:
+
+- **Espace YUV**: Luma (Y) + Chroma (U/V) pour analyse couleur séparée
+- **Canal Alpha**: Masque de validité pour pixels hors image (regard libre)
+- **Détection de mouvement**: Différence temporelle + flux optique simplifié
+- **Suivi d'objets**: ObjectTracker pour discrimination des objets en mouvement
+
+#### Architecture `color_fovea.py`
+
+| Classe | Description |
+|--------|-------------|
+| `ColorChannel` | Enum (LUMA, CHROMA_U, CHROMA_V, ALPHA, MOTION, MOTION_DIR) |
+| `ColorFoveaConfig` | Config étendue (use_color, motion_history, alpha_padding) |
+| `MotionVector` | Vecteur mouvement (dx, dy, magnitude, direction) |
+| `TrackedObject` | Objet suivi (position, vitesse, signature couleur, confiance) |
+| `ColorFovea` | Fovéa étendue avec sample_color() |
+| `ObjectTracker` | Suivi d'objets basé sur mouvement et couleur |
+
+#### Canaux de Sortie de `sample_color()`
+
+```python
+result = fovea.sample_color(image_bgr)
+# Retourne:
+#   'luma': Luminosité Y (num_rings × num_sectors)
+#   'chroma_u': Chrominance bleu-jaune U
+#   'chroma_v': Chrominance rouge-vert V
+#   'alpha': Validité (1=dans image, 0=hors limites)
+#   'motion_mag': Magnitude mouvement
+#   'motion_dir': Direction mouvement (radians)
+```
+
+#### Alpha pour Regard Libre
+
+Le canal alpha permet de positionner l'attention n'importe où, même partiellement
+hors de l'image source. Les cellules hors limites ont alpha=0, ce qui permet:
+- Exploration jusqu'aux bords extrêmes
+- Pondération des calculs par alpha (ignorer les pixels invalides)
+- Support du zoom virtuel aux limites
+
+#### Détection de Mouvement
+
+1. **Différence temporelle**: Comparaison de luma entre frames
+2. **Flux optique simplifié**: Corrélation de phase entre secteurs adjacents
+3. **Vecteurs de mouvement**: Direction et magnitude par cellule polaire
+4. **Mouvement dominant**: Agrégation pour détection de mouvement global
+
+#### Intégration dans l'Agent
+
+Nouvelle option `--color` dans `live_stereo_agent.py`:
+
+```bash
+# Mode grayscale standard (rapide)
+python examples/live_stereo_agent.py
+
+# Mode couleur avec détection de mouvement
+python examples/live_stereo_agent.py --color
+```
+
+Affichage enrichi en mode couleur:
+- Indicateur "COLOR" en bas à droite
+- Vecteur de mouvement dominant (magnitude et direction)
+
+#### Tests
+- 36 tests unitaires dans `tests/test_color_fovea.py`
+- Couverture: ColorChannel, config, MotionVector, TrackedObject, ColorFovea, ObjectTracker
+
+---
+
 ## Statistiques du Projet
 
 ### Tests Unitaires
@@ -373,8 +445,10 @@ Modifications de `live_stereo_agent.py`:
 | temporal.py | 22 |
 | genesis.py | 30 |
 | fovea.py | 40 |
+| attention.py | 42 |
 | opencl_backend.py | 16 |
-| **Total** | **210** |
+| color_fovea.py | 36 |
+| **Total** | **288** |
 
 ### Structure du Code
 
@@ -388,12 +462,14 @@ src/neuronspikes/
 ├── temporal.py          # Corrélation temporelle
 ├── genesis.py           # Genèse de nouveaux neurones
 ├── fovea.py             # Rétine fovéale polaire
+├── attention.py         # Système d'attention (zoom, IOR, mémoire)
+├── color_fovea.py       # Fovéa couleur avec mouvement
 └── opencl_backend.py    # Accélération GPU
 
 examples/
 ├── live_retina.py       # Visualiseur rétine mono
 ├── live_stereo.py       # Visualiseur stéréo simple
-└── live_stereo_agent.py # Agent stéréo autonome
+└── live_stereo_agent.py # Agent stéréo autonome (--color)
 ```
 
 ### Dépôt GitHub
