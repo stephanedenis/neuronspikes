@@ -15,10 +15,14 @@ Contrôles:
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Forcer le backend GTK au lieu de Qt (évite le clignotement)
+os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
 
 import cv2
 import numpy as np
@@ -62,6 +66,10 @@ class RetinaVisualizer:
         # Capture vidéo
         self.cap: cv2.VideoCapture | None = None
         
+        # Buffer pour éviter le clignotement (garde la dernière frame valide)
+        self._last_valid_frame: NDArray[np.uint8] | None = None
+        self._last_display: NDArray[np.uint8] | None = None
+        
         # Statistiques
         self.fps_history: list[float] = []
         self.frame_count = 0
@@ -83,6 +91,8 @@ class RetinaVisualizer:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, self.config.target_fps)
+        # Réduire le buffer de la caméra pour moins de latence
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
         actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -213,9 +223,28 @@ class RetinaVisualizer:
             while True:
                 # Capturer une frame
                 ret, frame = self.cap.read()
-                if not ret:
-                    print("⚠️  Erreur de lecture caméra")
-                    break
+                
+                # Gérer les frames corrompues ou manquantes
+                if not ret or frame is None or frame.size == 0:
+                    # Utiliser la dernière frame valide si disponible
+                    if self._last_display is not None:
+                        cv2.imshow(self.config.window_name, self._last_display)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q') or key == 27:
+                        break
+                    continue
+                
+                # Vérifier que la frame est valide (pas de pixels aberrants)
+                if np.mean(frame) < 1 or np.mean(frame) > 254:
+                    if self._last_display is not None:
+                        cv2.imshow(self.config.window_name, self._last_display)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q') or key == 27:
+                        break
+                    continue
+                
+                # Sauvegarder la frame valide
+                self._last_valid_frame = frame.copy()
                 
                 # Traiter
                 input_img, retina_img = self.process_frame(frame)
@@ -234,6 +263,7 @@ class RetinaVisualizer:
                 
                 # Créer l'affichage
                 display = self.create_display(input_img, retina_img, fps)
+                self._last_display = display  # Buffer pour éviter clignotement
                 
                 # Afficher
                 cv2.imshow(self.config.window_name, display)
