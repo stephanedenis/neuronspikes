@@ -1,0 +1,52 @@
+#!/bin/bash
+# Hook post-commit pour neuronspikes
+# Met à jour le journal de bord avec les détails du commit
+
+JOURNAL_FILE="docs/JOURNAL.md"
+
+# Vérifier si le journal existe
+if [ ! -f "$JOURNAL_FILE" ]; then
+    exit 0
+fi
+
+# Obtenir les infos du dernier commit
+COMMIT_HASH=$(git rev-parse --short HEAD)
+COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+COMMIT_DATE=$(git log -1 --pretty=%cd --date=format:'%Y-%m-%d %H:%M')
+COMMIT_STATS=$(git diff-tree --stat --no-commit-id HEAD | tail -1)
+CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | head -5)
+FILE_COUNT=$(git diff-tree --no-commit-id --name-only -r HEAD | wc -l)
+
+# Créer l'entrée de commit pour le journal
+# Note: On n'ajoute pas automatiquement pour éviter les boucles infinies
+# Mais on génère un fichier de log séparé
+
+LOG_DIR="docs/commits"
+mkdir -p "$LOG_DIR"
+
+LOG_FILE="$LOG_DIR/${COMMIT_HASH}.md"
+
+{
+    echo "# Commit $COMMIT_HASH"
+    echo ""
+    echo "**Date**: $COMMIT_DATE"
+    echo "**Message**: $COMMIT_MSG"
+    echo ""
+    echo "## Statistiques"
+    echo "\`\`\`"
+    echo "$COMMIT_STATS"
+    echo "\`\`\`"
+    echo ""
+    echo "## Fichiers modifiés ($FILE_COUNT)"
+    echo "$CHANGED_FILES" | while read -r file; do
+        echo "- \`$file\`"
+    done
+    if [ "$FILE_COUNT" -gt 5 ]; then
+        echo "- ... et $((FILE_COUNT - 5)) autres fichiers"
+    fi
+    echo ""
+    echo "---"
+    echo "*Généré automatiquement par post-commit hook*"
+} > "$LOG_FILE"
+
+echo "📝 Log de commit créé: $LOG_FILE"
