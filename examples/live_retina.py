@@ -31,7 +31,7 @@ from numpy.typing import NDArray
 # Ajouter le chemin src pour l'import
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from neuronspikes import create_retina, RetinaLayer
+from neuronspikes import create_retina, RetinaLayer, GroupDetector, GroupDetectorConfig, visualize_groups
 
 
 @dataclass
@@ -43,6 +43,8 @@ class VisualizerConfig:
     window_name: str = "NeuronSpikes - Rétine Artificielle"
     target_fps: int = 60
     show_stats: bool = True
+    show_groups: bool = True  # Afficher les groupes d'activation
+    intensity_threshold: int = 200  # Seuil pour détecter les activations "fortes"
 
 
 class RetinaVisualizer:
@@ -63,12 +65,20 @@ class RetinaVisualizer:
             fps=self.config.target_fps
         )
         
+        # Détecteur de groupes d'activation
+        self.group_detector = GroupDetector(GroupDetectorConfig(
+            min_group_size=3,  # Au moins 3 pixels pour former un groupe
+            connectivity=8,    # 8-connexité pour les diagonales
+            track_history=10   # Garder 10 frames d'historique
+        ))
+        
         # Capture vidéo
         self.cap: cv2.VideoCapture | None = None
         
         # Buffer pour éviter le clignotement (garde la dernière frame valide)
         self._last_valid_frame: NDArray[np.uint8] | None = None
         self._last_display: NDArray[np.uint8] | None = None
+        self._last_groups_count: int = 0
         
         # Statistiques
         self.fps_history: list[float] = []
@@ -108,7 +118,7 @@ class RetinaVisualizer:
             frame: Image BGR de la caméra
             
         Returns:
-            Tuple (image_mono_resized, retina_output)
+            Tuple (image_mono_resized, retina_output, groups_image)
         """
         # Convertir en niveaux de gris
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -124,15 +134,28 @@ class RetinaVisualizer:
         self.retina.process_frame(gray_resized)
         
         # Obtenir le pattern d'activation (équivalent à l'intensité)
-        # C'est le cumul des activations pour la frame
         retina_output = self.retina.get_activation_pattern()
         
-        return gray_resized, retina_output
+        # Détecter les groupes d'activation sur les pixels "brillants"
+        # On applique un seuil pour ne garder que les activations fortes
+        activations = gray_resized > self.config.intensity_threshold
+        groups = self.group_detector.detect_groups(
+            activations, 
+            slot=0, 
+            frame=self.frame_count
+        )
+        self._last_groups_count = len(groups)
+        
+        # Créer l'image des groupes
+        groups_img = visualize_groups(activations, groups)
+        
+        return gray_resized, retina_output, groups_img
     
     def create_display(
         self, 
         input_img: NDArray[np.uint8], 
         retina_img: NDArray[np.uint8],
+        groups_img: NDArray[np.uint8],
         fps: float
     ) -> NDArray[np.uint8]:
         """Crée l'image d'affichage combinée.
@@ -140,13 +163,14 @@ class RetinaVisualizer:
         Args:
             input_img: Image d'entrée monochrome
             retina_img: Sortie de la rétine
+            groups_img: Image des groupes d'activation (RGB)
             fps: FPS actuel
             
         Returns:
             Image combinée BGR pour affichage
         """
         # Taille d'affichage (upscale pour visibilité)
-        display_size = 384
+        display_size = 320  # Réduit pour 3 panneaux
         
         # Upscale les images
         input_display = cv2.resize(
@@ -159,6 +183,11 @@ class RetinaVisualizer:
             (display_size, display_size), 
             interpolation=cv2.INTER_NEAREST
         )
+        groups_display = cv2.resize(
+            groups_img, 
+            (display_size, display_size), 
+            interpolation=cv2.INTER_NEAREST
+        )
         
         # Convertir en BGR pour l'affichage
         input_bgr = cv2.cvtColor(input_display, cv2.COLOR_GRAY2BGR)
@@ -166,20 +195,25 @@ class RetinaVisualizer:
         # Colormap pour la rétine (plus visuel)
         retina_colored = cv2.applyColorMap(retina_display, cv2.COLORMAP_INFERNO)
         
-        # Combiner horizontalement
-        combined = np.hstack([input_bgr, retina_colored])
+        # Groupes: RGB -> BGR pour OpenCV
+        groups_bgr = cv2.cvtColor(groups_img, cv2.COLOR_RGB2BGR)
+        groups_bgr = cv2.resize(groups_bgr, (display_size, display_size), interpolation=cv2.INTER_NEAREST)
+        
+        # Combiner horizontalement (3 panneaux)
+        combined = np.hstack([input_bgr, retina_colored, groups_bgr])
         
         # Ajouter les labels
         font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(combined, "ENTREE (Camera)", (10, 25), font, 0.6, (255, 255, 255), 1)
-        cv2.putText(combined, "RETINE (Activations)", (display_size + 10, 25), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, "ENTREE", (10, 25), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, "RETINE", (display_size + 10, 25), font, 0.6, (255, 255, 255), 1)
+        cv2.putText(combined, f"GROUPES ({self._last_groups_count})", (display_size * 2 + 10, 25), font, 0.6, (255, 255, 255), 1)
         
         if self.config.show_stats:
             # Stats en bas
             stats_y = display_size - 10
             cv2.putText(
                 combined, 
-                f"FPS: {fps:.1f} | Frames: {self.frame_count} | Res: {self.config.retina_width}x{self.config.retina_height}",
+                f"FPS: {fps:.1f} | Frames: {self.frame_count}",
                 (10, stats_y), 
                 font, 0.5, (0, 255, 0), 1
             )
@@ -192,9 +226,19 @@ class RetinaVisualizer:
                 (display_size + 10, stats_y),
                 font, 0.5, (0, 255, 255), 1
             )
+            
+            # Afficher les stats des groupes
+            total_groups = self.group_detector.stats['total_groups']
+            cv2.putText(
+                combined,
+                f"Total: {total_groups:,}",
+                (display_size * 2 + 10, stats_y),
+                font, 0.5, (0, 255, 255), 1
+            )
         
-        # Ligne de séparation
+        # Lignes de séparation
         cv2.line(combined, (display_size, 0), (display_size, display_size), (128, 128, 128), 1)
+        cv2.line(combined, (display_size * 2, 0), (display_size * 2, display_size), (128, 128, 128), 1)
         
         return combined
     
@@ -246,8 +290,8 @@ class RetinaVisualizer:
                 # Sauvegarder la frame valide
                 self._last_valid_frame = frame.copy()
                 
-                # Traiter
-                input_img, retina_img = self.process_frame(frame)
+                # Traiter (retourne maintenant 3 images)
+                input_img, retina_img, groups_img = self.process_frame(frame)
                 self.frame_count += 1
                 
                 # Calculer FPS
@@ -261,8 +305,8 @@ class RetinaVisualizer:
                     fps = sum(self.fps_history) / len(self.fps_history)
                 last_time = current_time
                 
-                # Créer l'affichage
-                display = self.create_display(input_img, retina_img, fps)
+                # Créer l'affichage (3 panneaux)
+                display = self.create_display(input_img, retina_img, groups_img, fps)
                 self._last_display = display  # Buffer pour éviter clignotement
                 
                 # Afficher
