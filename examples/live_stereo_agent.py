@@ -892,6 +892,98 @@ class StereoCamera:
         self.cap.release()
 
 
+def draw_neuron_stack_2d(stack: NeuronStack, size: int = 180) -> np.ndarray:
+    """Visualise le NeuronStack en 2D.
+    
+    Affiche chaque couche comme une grille avec:
+    - Neurones actifs en couleur vive
+    - Neurones dormants en gris
+    - Patterns en cours de détection en contour
+    
+    Args:
+        stack: Le NeuronStack à visualiser
+        size: Taille de l'image de sortie
+        
+    Returns:
+        Image BGR de la visualisation
+    """
+    num_layers = stack.num_layers
+    stats = stack.get_stats()
+    
+    # Créer l'image
+    viz = np.zeros((size, size, 3), dtype=np.uint8)
+    
+    # Diviser verticalement par couches
+    layer_height = size // num_layers
+    
+    # Couleurs par couche
+    layer_colors = [
+        (100, 200, 255),  # Couche 0: Cyan
+        (100, 255, 150),  # Couche 1: Vert
+        (255, 200, 100),  # Couche 2: Orange
+        (255, 100, 200),  # Couche 3: Rose
+    ]
+    
+    for layer_idx, layer in enumerate(stack.layers):
+        y_start = layer_idx * layer_height
+        y_end = (layer_idx + 1) * layer_height
+        
+        # Fond de la couche (gradient subtil)
+        base_color = layer_colors[layer_idx % len(layer_colors)]
+        for y in range(y_start, y_end):
+            intensity = 20 + 10 * (y - y_start) // layer_height
+            viz[y, :] = [intensity, intensity, intensity]
+        
+        # Dessiner les neurones
+        h, w = layer.shape
+        neurons = layer.neurons
+        
+        if neurons:
+            # Taille d'une cellule
+            cell_w = size // w
+            cell_h = layer_height // h
+            
+            for neuron in neurons:
+                # Position du centroïde
+                cx, cy = neuron.centroid
+                px = int(cx * cell_w)
+                py = y_start + int(cy * cell_h)
+                
+                # Taille basée sur le RF
+                radius = max(2, int(math.sqrt(neuron._rf_size) * cell_w / w))
+                
+                # Couleur basée sur l'état
+                from neuronspikes.genesis import NeuronState
+                if neuron.state == NeuronState.FIRING:
+                    color = (0, 255, 255)  # Jaune vif
+                    radius = int(radius * 1.5)
+                elif neuron.state == NeuronState.CHARGING:
+                    intensity = int(128 + neuron.potential * 127)
+                    color = (intensity, intensity, base_color[2])
+                elif neuron.state == NeuronState.REFRACTORY:
+                    color = (50, 50, 100)  # Bleu sombre
+                else:
+                    color = (80, 80, 80)  # Gris
+                
+                cv2.circle(viz, (px, py), radius, color, -1)
+                
+                # Contour pour mieux voir
+                cv2.circle(viz, (px, py), radius, base_color, 1)
+        
+        # Label de la couche
+        label = f"L{layer_idx}: {len(neurons)}n"
+        cv2.putText(viz, label, (5, y_end - 5), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, base_color, 1)
+    
+    # Stats globales en haut
+    total_n = stats['total_neurons']
+    patterns = sum(stats.get('patterns_per_layer', []))
+    cv2.putText(viz, f"N:{total_n} P:{patterns}", (size - 70, 12),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    
+    return viz
+
+
 def draw_agent_overlay(
     image: np.ndarray,
     gaze_x: float,
@@ -1108,6 +1200,9 @@ def main():
             left_fovea_viz = visualize_fovea(agent.left_fovea, size=fovea_size)
             right_fovea_viz = visualize_fovea(agent.right_fovea, size=fovea_size)
             
+            # Visualisation du NeuronStack
+            stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=fovea_size)
+            
             # Carte de corrélation ou disparité
             if show_disparity:
                 disparity = result['left_act'] - result['right_act']
@@ -1143,8 +1238,8 @@ def main():
             # Ligne 1: images stéréo
             row1 = np.hstack([left_small, right_small])
             
-            # Ligne 2: fovéas et analyse
-            fovea_row = np.hstack([left_fovea_viz, analysis_viz, right_fovea_viz])
+            # Ligne 2: fovéas, analyse et neurones
+            fovea_row = np.hstack([left_fovea_viz, analysis_viz, stack_viz, right_fovea_viz])
             # Redimensionner pour correspondre
             fovea_row = cv2.resize(fovea_row, (row1.shape[1], fovea_size))
             
