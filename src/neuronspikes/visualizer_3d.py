@@ -327,6 +327,9 @@ class NeuronVisualizer3D:
             
             # Dessiner les neurones
             self._draw_neurons(layer, y, layer_color)
+        
+        # Dessiner les connexions inter-couches
+        self._draw_connections()
     
     def _draw_layer_plane(self, layer: NeuronLayer, y: float, color: Tuple[float, ...]):
         """Dessine le plan d'une couche."""
@@ -396,6 +399,105 @@ class NeuronVisualizer3D:
             glColor4f(*final_color)
             glCallList(self._sphere_list)
             glPopMatrix()
+    
+    def _draw_connections(self):
+        """Dessine les connexions entre neurones de couches adjacentes.
+        
+        Les connexions montrent les relations hiérarchiques:
+        - Un neurone de couche N+1 est connecté aux neurones de couche N
+          dont les champs récepteurs se chevauchent avec le sien.
+        """
+        if self.stack.num_layers < 2:
+            return
+        
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glLineWidth(1.0)
+        
+        glBegin(GL_LINES)
+        
+        # Pour chaque paire de couches adjacentes
+        for layer_idx in range(1, self.stack.num_layers):
+            upper_layer = self.stack.layers[layer_idx]
+            lower_layer = self.stack.layers[layer_idx - 1]
+            
+            y_upper = layer_idx * self.config.layer_spacing
+            y_lower = (layer_idx - 1) * self.config.layer_spacing
+            
+            # Limiter le nombre de connexions pour la performance
+            upper_neurons = upper_layer.neurons[:self.config.max_neurons_per_layer]
+            lower_neurons = lower_layer.neurons[:self.config.max_neurons_per_layer]
+            
+            if not lower_neurons:
+                continue
+            
+            for upper_neuron in upper_neurons:
+                # Position du neurone supérieur
+                ux, uy_centroid = upper_neuron.centroid
+                h_up, w_up = upper_layer.shape
+                nx_up = (ux / w_up - 0.5) * 2 * self.config.layer_scale * (w_up / max(w_up, h_up))
+                nz_up = (uy_centroid / h_up - 0.5) * 2 * self.config.layer_scale * (h_up / max(w_up, h_up))
+                
+                # Trouver les neurones inférieurs qui se chevauchent
+                for lower_neuron in lower_neurons:
+                    # Calculer le chevauchement des RF
+                    overlap = self._compute_rf_overlap(upper_neuron, lower_neuron, upper_layer.shape, lower_layer.shape)
+                    
+                    if overlap > 0.1:  # Seuil de chevauchement
+                        # Position du neurone inférieur
+                        lx, ly_centroid = lower_neuron.centroid
+                        h_low, w_low = lower_layer.shape
+                        nx_low = (lx / w_low - 0.5) * 2 * self.config.layer_scale * (w_low / max(w_low, h_low))
+                        nz_low = (ly_centroid / h_low - 0.5) * 2 * self.config.layer_scale * (h_low / max(w_low, h_low))
+                        
+                        # Couleur basée sur la force de la connexion
+                        alpha = min(0.8, overlap)
+                        
+                        # Gradient de couleur: vert (actif) ou gris (dormant)
+                        if upper_neuron.state == NeuronState.FIRING or lower_neuron.state == NeuronState.FIRING:
+                            glColor4f(0.2, 1.0, 0.3, alpha)  # Vert vif si actif
+                        else:
+                            glColor4f(*self.config.connection_color[:3], alpha * 0.5)
+                        
+                        # Dessiner la ligne
+                        glVertex3f(nx_low, y_lower, nz_low)
+                        glVertex3f(nx_up, y_upper, nz_up)
+        
+        glEnd()
+        glDisable(GL_BLEND)
+        glEnable(GL_LIGHTING)
+    
+    def _compute_rf_overlap(self, neuron_up: Neuron, neuron_low: Neuron, 
+                            shape_up: tuple, shape_low: tuple) -> float:
+        """Calcule le chevauchement spatial des champs récepteurs.
+        
+        Utilise une approximation basée sur la distance des centroïdes
+        car les RF peuvent avoir des tailles différentes entre couches.
+        """
+        # Normaliser les positions des centroïdes
+        cx_up, cy_up = neuron_up.centroid
+        cx_low, cy_low = neuron_low.centroid
+        
+        # Normaliser à [0, 1]
+        nx_up = cx_up / shape_up[1]
+        ny_up = cy_up / shape_up[0]
+        nx_low = cx_low / shape_low[1]
+        ny_low = cy_low / shape_low[0]
+        
+        # Distance normalisée (max = sqrt(2) ≈ 1.414)
+        dist = math.sqrt((nx_up - nx_low)**2 + (ny_up - ny_low)**2)
+        
+        # Convertir en chevauchement (proche = fort chevauchement)
+        # Rayon effectif basé sur la taille du RF
+        radius_up = math.sqrt(neuron_up._rf_size) / max(shape_up)
+        radius_low = math.sqrt(neuron_low._rf_size) / max(shape_low)
+        combined_radius = radius_up + radius_low
+        
+        if dist > combined_radius:
+            return 0.0
+        
+        return 1.0 - (dist / combined_radius)
     
     def _draw_hud(self):
         """Dessine le HUD (texte 2D)."""
