@@ -38,6 +38,16 @@ import cv2
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Tuple, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+
+# === OPTIMISATIONS PERFORMANCE ===
+# Activer OpenCL pour OpenCV (utilise la GTX 750 Ti par défaut)
+if cv2.ocl.haveOpenCL():
+    cv2.ocl.setUseOpenCL(True)
+    print(f"OpenCV OpenCL: {cv2.ocl.Device.getDefault().name()}")
+
+# Thread pool pour traitement parallèle L/R
+_executor = ThreadPoolExecutor(max_workers=4)
 
 # Ajouter le chemin du projet
 sys.path.insert(0, str(__file__).rsplit('/', 2)[0] + '/src')
@@ -877,13 +887,16 @@ class AttentionAgent:
         """
         self.frame_count += 1
         
-        # Calculer les cartes de saillance
-        saliency_left = self.compute_saliency_map(
-            left_gray, self.prev_left_gray
+        # Calculer les cartes de saillance EN PARALLÈLE
+        # Utilise le thread pool global pour traiter L/R simultanément
+        future_left = _executor.submit(
+            self.compute_saliency_map, left_gray, self.prev_left_gray
         )
-        saliency_right = self.compute_saliency_map(
-            right_gray, self.prev_right_gray
+        future_right = _executor.submit(
+            self.compute_saliency_map, right_gray, self.prev_right_gray
         )
+        saliency_left = future_left.result()
+        saliency_right = future_right.result()
         
         # Mettre à jour l'historique
         self.prev_left_gray = left_gray.copy()
@@ -954,11 +967,13 @@ class AttentionAgent:
         left_motion = None
         right_motion = None
         
-        # Échantillonner avec les fovéas
+        # Échantillonner avec les fovéas EN PARALLÈLE
         if self.use_color and left_color is not None and right_color is not None:
-            # Mode couleur: échantillonner avec ColorFovea
-            left_color_data = self.left_fovea.sample_color(left_color)
-            right_color_data = self.right_fovea.sample_color(right_color)
+            # Mode couleur: échantillonner avec ColorFovea en parallèle
+            future_left = _executor.submit(self.left_fovea.sample_color, left_color)
+            future_right = _executor.submit(self.right_fovea.sample_color, right_color)
+            left_color_data = future_left.result()
+            right_color_data = future_right.result()
             
             # Extraire luma pour la corrélation stéréo
             left_act = left_color_data['luma']
@@ -969,7 +984,9 @@ class AttentionAgent:
             right_motion = self.right_fovea.get_dominant_motion()
         elif self.opencl is not None:
             try:
-                left_act = self.opencl.polar_sample(
+                # Échantillonnage OpenCL en parallèle
+                future_left = _executor.submit(
+                    self.opencl.polar_sample,
                     left_gray, 
                     int(gaze_x), 
                     int(gaze_y),
@@ -977,14 +994,17 @@ class AttentionAgent:
                     self.config.num_rings,
                     self.config.num_sectors
                 )
-                right_act = self.opencl.polar_sample(
+                future_right = _executor.submit(
+                    self.opencl.polar_sample,
                     right_gray,
-                    int(gaze_x - vergence_offset),
+                    int(gaze_x_right),
                     int(gaze_y),
                     self.cell_params,
                     self.config.num_rings,
                     self.config.num_sectors
                 )
+                left_act = future_left.result()
+                right_act = future_right.result()
             except Exception as e:
                 # Fallback CPU
                 left_act = self.left_fovea.sample(left_gray)
