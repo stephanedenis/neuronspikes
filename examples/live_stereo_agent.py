@@ -62,6 +62,9 @@ from neuronspikes import (
     # Voies rétiniennes bio-inspirées
     RetinalProcessor,
     PathwayConfig,
+    # Chiasma optique pour fusion binoculaire
+    OpticChiasm,
+    ChiasmConfig,
 )
 
 
@@ -330,6 +333,17 @@ class AttentionAgent:
         self.retinal_processor = RetinalProcessor(pathway_config)
         self.use_retinal_saliency = False  # Désactivé: utiliser ColorFovea.compute_saliency()
         print(f"Saillance bio-inspirée: coordonnées POLAIRES via ColorFovea")
+        
+        # Chiasma optique - croisement des fibres pour fusion binoculaire
+        chiasm_config = ChiasmConfig(
+            num_sectors=fovea_config.num_sectors,
+            num_rings=fovea_config.num_rings,
+            foveal_bilateral=True,
+            foveal_bilateral_rings=4,
+        )
+        self.chiasm = OpticChiasm(chiasm_config)
+        self._last_hemifields = None  # Données des hémichamps
+        print(f"Chiasma optique: fusion binoculaire par hémichamp")
     
     def _build_cell_params(self):
         """Pré-calcule les paramètres des cellules pour OpenCL."""
@@ -985,6 +999,24 @@ class AttentionAgent:
         if len(self.correlation_history) > 100:
             self.correlation_history.pop(0)
         
+        # === CHIASMA OPTIQUE - Fusion binoculaire par hémichamp ===
+        # Réorganise (œil gauche, œil droit) → (champ visuel gauche, champ visuel droit)
+        left_hemi, right_hemi = self.chiasm.process(left_act, right_act)
+        self._last_hemifields = (left_hemi, right_hemi)
+        
+        # Utiliser l'erreur de vergence du chiasma pour améliorer la convergence
+        chiasm_vergence_error, _ = self.chiasm.get_vergence_error(left_hemi, right_hemi)
+        fusion_quality = self.chiasm.get_fusion_quality(left_hemi, right_hemi)
+        
+        # Ajuster la vergence basée sur le chiasma (plus bio-fidèle)
+        if abs(chiasm_vergence_error) > 0.05:  # Seuil de sensibilité
+            # Correction proportionnelle
+            vergence_correction = chiasm_vergence_error * 2.0  # Gain
+            self.vergence_velocity += vergence_correction * 0.1
+            self.vergence_velocity *= 0.9  # Damping
+            self.vergence_offset += self.vergence_velocity
+            self.vergence_offset = max(self.vergence_min, min(self.vergence_max, self.vergence_offset))
+        
         # SAILLANCE BIO-INSPIRÉE en coordonnées POLAIRES
         # Calculée APRÈS l'échantillonnage fovéal (ce qui est bio-fidèle)
         if self.use_color and hasattr(self.left_fovea, 'compute_saliency'):
@@ -1101,6 +1133,10 @@ class AttentionAgent:
             'stack_stats': stack_stats,
             # Saillance bio-inspirée POLAIRE (via ColorFovea)
             'polar_saliency': self._last_polar_saliency,
+            # Chiasma optique - fusion binoculaire
+            'hemifields': self._last_hemifields,
+            'fusion_quality': self.chiasm.get_fusion_quality(*self._last_hemifields) if self._last_hemifields else 0.0,
+            'depth_map': self.chiasm.get_depth_map(*self._last_hemifields) if self._last_hemifields else None,
             # Voies rétiniennes (pour visualisation seulement)
             'retinal_result': getattr(self, '_last_retinal_result', None),
             'use_retinal_saliency': self.use_retinal_saliency,

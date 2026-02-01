@@ -77,6 +77,10 @@ __all__ = [
     "LateralInhibition",
     "GaborFilterBank",
     "RetinalProcessor",
+    # Chiasma optique
+    "OpticChiasm",
+    "ChiasmConfig",
+    "HemifieldData",
     # OpenCL Backend
     "OpenCLBackend",
     "get_opencl_backend",
@@ -110,6 +114,7 @@ from .retinal_pathways import (
     PathwayConfig, MagnocellularPathway, ParvocellularPathway,
     LateralInhibition, GaborFilterBank, RetinalProcessor
 )
+from .optic_chiasm import OpticChiasm, ChiasmConfig, HemifieldData
 from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices
 
 # Import optionnel du visualiseur 3D (nécessite PyOpenGL)
