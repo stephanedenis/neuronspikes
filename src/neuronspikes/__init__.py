@@ -31,6 +31,9 @@ __all__ = [
     "NeuronLayer",
     "GenesisConfig",
     "visualize_neurons",
+    # Pile de couches de neurones
+    "NeuronStack",
+    "visualize_stack",
     # Synapses et apprentissage Hebbien
     "Synapse",
     "SynapseType",
@@ -72,6 +75,10 @@ __all__ = [
     "get_opencl_backend",
     "is_opencl_available",
     "list_opencl_devices",
+    # Visualisation 3D
+    "NeuronVisualizer3D",
+    "VisualizerConfig",
+    "Camera3D",
 ]
 
 from .model import SpikingModel
@@ -79,7 +86,7 @@ from .retina import RetinaLayer, RetinaConfig, create_retina
 from .lut import BIT_REVERSAL_LUT, INTENSITY_TO_SPIKES
 from .groups import GroupDetector, GroupDetectorConfig, ActivationGroup, visualize_groups
 from .temporal import TemporalPattern, TemporalCorrelator, CorrelationConfig, visualize_patterns
-from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConfig, visualize_neurons
+from .genesis import Neuron, NeuronConfig, NeuronState, NeuronLayer, GenesisConfig, visualize_neurons, NeuronStack, visualize_stack
 from .synapses import Synapse, SynapseType, SynapticConfig, SynapticNetwork, HebbianLayer
 from .fabric import Fabric, FabricConfig, LearningCapability, Cortex
 from .fovea import Fovea, FoveaConfig, GazePoint, PolarCell, StereoFovea, visualize_fovea
@@ -93,3 +100,12 @@ from .color_fovea import (
     TrackedObject, ColorFovea, ObjectTracker, visualize_color_fovea
 )
 from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices
+
+# Import optionnel du visualiseur 3D (nécessite PyOpenGL)
+try:
+    from .visualizer_3d import NeuronVisualizer3D, VisualizerConfig, Camera3D
+except ImportError:
+    # PyOpenGL non installé
+    NeuronVisualizer3D = None
+    VisualizerConfig = None
+    Camera3D = None

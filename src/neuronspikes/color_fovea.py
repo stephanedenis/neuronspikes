@@ -252,6 +252,10 @@ class ColorFovea(Fovea):
                 self._chroma_v[ring_idx, sector_idx] = v
                 self._alpha[ring_idx, sector_idx] = alpha
         
+        # Synchroniser avec _activations de la classe parente pour visualize_fovea()
+        # Normaliser luma (0-255) vers activations (0-1)
+        self._activations = self._luma / 255.0
+        
         # Calculer le mouvement
         if compute_motion and len(self._luma_history) > 0:
             self._compute_motion()

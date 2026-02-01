@@ -257,6 +257,14 @@ class AttentionAgent:
         self.prev_left_act: Optional[np.ndarray] = None
         self.prev_right_act: Optional[np.ndarray] = None
         
+        # Vergence dynamique (convergence horizontale des yeux)
+        self.vergence_offset: float = 5.0  # Offset initial en pixels
+        self.vergence_velocity: float = 0.0  # Vélocité pour lissage
+        self.vergence_min: float = -30.0   # Vergence max divergente
+        self.vergence_max: float = 50.0    # Vergence max convergente (objets proches)
+        self.vergence_speed: float = 2.0   # Vitesse d'ajustement pixels/frame
+        self.vergence_search_range: int = 10  # Plage de recherche pour optimisation
+        
         # État
         self.autonomous = True
         self.frame_count = 0
@@ -266,6 +274,7 @@ class AttentionAgent:
         # Statistiques
         self.correlation_history: List[float] = []
         self.gpu_time_ms: float = 0.0
+        self.vergence_history: List[float] = []
     
     def _build_cell_params(self):
         """Pré-calcule les paramètres des cellules pour OpenCL."""
@@ -437,6 +446,106 @@ class AttentionAgent:
         
         return max(0.0, min(1.0, correlation))
     
+    def update_vergence(
+        self,
+        left_img: np.ndarray,
+        right_img: np.ndarray,
+        attention_x: float,
+        attention_y: float
+    ) -> float:
+        """Ajuste dynamiquement la vergence pour maximiser la corrélation.
+        
+        Cherche l'offset horizontal optimal entre les deux yeux pour
+        aligner parfaitement les images sur le point d'attention.
+        
+        Args:
+            left_img: Image gauche complète
+            right_img: Image droite complète
+            attention_x: Position X du regard dans l'image de référence
+            attention_y: Position Y du regard
+            
+        Returns:
+            Nouvel offset de vergence
+        """
+        # Taille de la fenêtre de recherche - plus grande pour meilleure corrélation
+        window_size = 64
+        half_w = window_size // 2
+        
+        # Position entière pour extraction
+        cx = int(attention_x)
+        cy = int(attention_y)
+        
+        # Vérifier les limites
+        h, w = left_img.shape[:2]
+        if cx - half_w < 0 or cx + half_w >= w or cy - half_w < 0 or cy + half_w >= h:
+            return self.vergence_offset  # Garder la vergence actuelle
+        
+        # Extraire la fenêtre de référence (œil gauche)
+        ref_window = left_img[cy - half_w:cy + half_w, cx - half_w:cx + half_w]
+        if len(ref_window.shape) == 3:
+            ref_gray = np.mean(ref_window, axis=2)
+        else:
+            ref_gray = ref_window.astype(float)
+        
+        # Normaliser la référence
+        ref_norm = ref_gray - np.mean(ref_gray)
+        ref_std = np.std(ref_gray) + 1e-6
+        ref_norm = ref_norm / ref_std
+        
+        # Chercher le meilleur offset (-30 à +30 pixels)
+        best_offset = self.vergence_offset
+        best_corr = -1.0
+        
+        # Recherche grossière puis fine
+        search_offsets = list(range(int(self.vergence_min), int(self.vergence_max) + 1, 3))
+        # Ajouter la vergence actuelle et ses voisins
+        for delta in range(-3, 4):
+            candidate = int(self.vergence_offset + delta)
+            if candidate not in search_offsets:
+                search_offsets.append(candidate)
+        
+        for offset in search_offsets:
+            test_x = cx + offset
+            if test_x - half_w < 0 or test_x + half_w >= w:
+                continue
+            
+            # Extraire la fenêtre test (œil droit)
+            test_window = right_img[cy - half_w:cy + half_w, test_x - half_w:test_x + half_w]
+            if len(test_window.shape) == 3:
+                test_gray = np.mean(test_window, axis=2)
+            else:
+                test_gray = test_window.astype(float)
+            
+            # Normaliser
+            test_norm = test_gray - np.mean(test_gray)
+            test_std = np.std(test_gray) + 1e-6
+            test_norm = test_norm / test_std
+            
+            # Corrélation croisée normalisée
+            corr = np.sum(ref_norm * test_norm) / (window_size * window_size)
+            
+            if corr > best_corr:
+                best_corr = corr
+                best_offset = float(offset)
+        
+        # Lissage avec vélocité (éviter les sauts brusques)
+        target_velocity = (best_offset - self.vergence_offset) * self.vergence_speed
+        self.vergence_velocity = 0.7 * self.vergence_velocity + 0.3 * target_velocity
+        
+        # Appliquer la vélocité
+        new_offset = self.vergence_offset + self.vergence_velocity
+        
+        # Clamp aux limites
+        new_offset = max(self.vergence_min, min(self.vergence_max, new_offset))
+        
+        # Historique pour analyse
+        self.vergence_history.append(new_offset)
+        if len(self.vergence_history) > 60:
+            self.vergence_history.pop(0)
+        
+        self.vergence_offset = new_offset
+        return new_offset
+    
     def decide_next_action(
         self,
         correlation: float,
@@ -568,8 +677,14 @@ class AttentionAgent:
         # Mettre à jour la position du regard
         gaze_x, gaze_y = self.gaze.update()
         
-        # Positionner les fovéas (légère vergence)
-        vergence_offset = 5  # pixels de différence pour vergence
+        # Mettre à jour la vergence dynamique pour optimiser l'alignement
+        if left_color is not None and right_color is not None:
+            self.update_vergence(left_color, right_color, gaze_x, gaze_y)
+        else:
+            self.update_vergence(left_gray, right_gray, gaze_x, gaze_y)
+        
+        # Positionner les fovéas avec vergence dynamique
+        vergence_offset = self.vergence_offset
         self.left_fovea.set_gaze(gaze_x + vergence_offset, gaze_y)
         self.right_fovea.set_gaze(gaze_x - vergence_offset, gaze_y)
         
@@ -668,6 +783,9 @@ class AttentionAgent:
             'right_color_data': right_color_data,
             'left_motion': left_motion,
             'right_motion': right_motion,
+            # Vergence dynamique
+            'vergence_offset': self.vergence_offset,
+            'vergence_velocity': self.vergence_velocity,
         }
     
     def force_saccade_to(self, x: float, y: float):
@@ -744,7 +862,9 @@ def draw_agent_overlay(
     in_saccade: bool,
     fixating: bool,
     saliency_peaks: List[SaliencyPoint],
-    correlation: float
+    correlation: float,
+    vergence_offset: float = 0.0,
+    is_left_eye: bool = True
 ) -> np.ndarray:
     """Dessine l'overlay de l'agent sur l'image."""
     img = image.copy()
@@ -793,6 +913,21 @@ def draw_agent_overlay(
     cv2.putText(img, f"Corr: {correlation:.2f}", (bar_x + bar_width + 5, bar_y + 10),
                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     
+    # Indicateur de vergence (ligne horizontale montrant le décalage)
+    if abs(vergence_offset) > 0.5:
+        verg_y = bar_y + bar_height + 15
+        verg_center = bar_x + bar_width // 2
+        verg_scale = 2.0  # pixels par unité de vergence
+        verg_end = int(verg_center + vergence_offset * verg_scale * (1 if is_left_eye else -1))
+        
+        # Ligne de base
+        cv2.line(img, (bar_x, verg_y), (bar_x + bar_width, verg_y), (80, 80, 80), 1)
+        # Marqueur central
+        cv2.line(img, (verg_center, verg_y - 3), (verg_center, verg_y + 3), (150, 150, 150), 1)
+        # Flèche de vergence
+        verg_color = (255, 200, 100) if vergence_offset > 0 else (100, 200, 255)
+        cv2.arrowedLine(img, (verg_center, verg_y), (verg_end, verg_y), verg_color, 2, tipLength=0.3)
+    
     return img
 
 
@@ -800,10 +935,10 @@ def main():
     parser = argparse.ArgumentParser(description='Agent stéréo avec attention')
     parser.add_argument('-c', '--camera', type=int, default=1,
                         help='Index de la caméra stéréo')
-    parser.add_argument('-r', '--rings', type=int, default=8,
-                        help='Nombre d\'anneaux (défaut: 8 pour rapidité)')
-    parser.add_argument('-s', '--sectors', type=int, default=8,
-                        help='Nombre de secteurs (défaut: 8 pour rapidité)')
+    parser.add_argument('-r', '--rings', type=int, default=16,
+                        help='Nombre d\'anneaux (défaut: 16 pour meilleure résolution)')
+    parser.add_argument('-s', '--sectors', type=int, default=24,
+                        help='Nombre de secteurs (défaut: 24 pour meilleure résolution)')
     parser.add_argument('--color', action='store_true',
                         help='Mode couleur avec détection de mouvement (ColorFovea)')
     args = parser.parse_args()
@@ -815,13 +950,13 @@ def main():
         print(f"Erreur: {e}")
         return 1
     
-    # Configuration des fovéas - petite et rapide
-    # Fovéa de 64px de rayon max pour traitement léger
+    # Configuration des fovéas - grande zone pour meilleure convergence stéréo
+    # Plus de résolution = meilleure corrélation entre les deux yeux
     config = FoveaConfig(
         num_rings=args.rings,
         num_sectors=args.sectors,
-        fovea_radius=16,      # Zone centrale haute résolution: 16px
-        max_radius=64,        # Rayon total: 64px (fovéa de 128px de diamètre)
+        fovea_radius=32,      # Zone centrale haute résolution: 32px
+        max_radius=128,       # Rayon total: 128px (fovéa de 256px de diamètre)
     )
     
     # Créer l'agent d'attention
@@ -903,26 +1038,31 @@ def main():
                 start_time = time.time()
             
             # Visualisation
-            # Dessiner l'overlay sur les deux images
+            # Dessiner l'overlay sur les deux images avec vergence dynamique
+            vergence = result['vergence_offset']
             left_viz = draw_agent_overlay(
                 left, 
-                result['gaze_x'] + 5,  # Offset vergence
+                result['gaze_x'] + vergence,  # Position œil gauche
                 result['gaze_y'],
                 config,
                 result['in_saccade'],
                 result['fixating'],
                 result['saliency_peaks'],
-                result['correlation']
+                result['correlation'],
+                vergence_offset=vergence,
+                is_left_eye=True
             )
             right_viz = draw_agent_overlay(
                 right,
-                result['gaze_x'] - 5,
+                result['gaze_x'] - vergence,  # Position œil droit
                 result['gaze_y'],
                 config,
                 result['in_saccade'],
                 result['fixating'],
                 result['saliency_peaks'],
-                result['correlation']
+                result['correlation'],
+                vergence_offset=vergence,
+                is_left_eye=False
             )
             
             # Visualisation des fovéas
@@ -997,6 +1137,13 @@ def main():
             zoom_text = f"Zoom: {result['zoom_level']}/7 (x{result['zoom_scale']:.1f})"
             cv2.putText(display, zoom_text, (display_w + 10, 45),
                        font, 0.4, (200, 200, 100), 1)
+            
+            # Affichage vergence dynamique
+            verg = result['vergence_offset']
+            verg_dir = "CONV" if verg > 0 else ("DIV" if verg < 0 else "PAR")
+            verg_text = f"Vergence: {verg_dir} {abs(verg):.1f}px"
+            cv2.putText(display, verg_text, (display_w + 100, 45),
+                       font, 0.4, (100, 200, 255), 1)
             
             if result['num_pois'] > 0:
                 cv2.putText(display, f"POIs: {result['num_pois']}", 

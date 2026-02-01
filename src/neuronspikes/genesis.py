@@ -442,3 +442,275 @@ def visualize_neurons(
             output[neuron.receptive_field] = color
     
     return output
+
+
+class NeuronStack:
+    """Pile de couches de neurones empilables.
+    
+    Permet de créer une hiérarchie de N couches où chaque couche
+    détecte des patterns de la couche inférieure:
+    
+    - Couche 0: Détecte les patterns de pixels (rétine)
+    - Couche 1: Détecte les patterns de neurones de couche 0
+    - Couche N: Détecte les compositions de neurones N-1
+    
+    Chaque couche peut avoir sa propre résolution et configuration.
+    """
+    
+    def __init__(
+        self,
+        base_shape: tuple[int, int],
+        num_layers: int = 3,
+        config: Optional[GenesisConfig] = None,
+        neuron_config: Optional[NeuronConfig] = None,
+        reduction_factor: float = 0.5
+    ):
+        """Initialise la pile de couches.
+        
+        Args:
+            base_shape: Dimensions (H, W) de la couche d'entrée (rétine)
+            num_layers: Nombre de couches de neurones à créer
+            config: Configuration de genèse (partagée ou personnalisée)
+            neuron_config: Configuration des neurones
+            reduction_factor: Facteur de réduction de résolution par couche
+                             (1.0 = même taille, 0.5 = moitié)
+        """
+        self.base_shape = base_shape
+        self.num_layers = num_layers
+        self.config = config or GenesisConfig()
+        self.neuron_config = neuron_config or NeuronConfig()
+        self.reduction_factor = reduction_factor
+        
+        # Créer les couches
+        self._layers: list[NeuronLayer] = []
+        self._layer_shapes: list[tuple[int, int]] = []
+        
+        current_shape = base_shape
+        for layer_id in range(num_layers):
+            self._layer_shapes.append(current_shape)
+            self._layers.append(NeuronLayer(
+                layer_id=layer_id,
+                shape=current_shape,
+                config=self.config,
+                neuron_config=self.neuron_config,
+            ))
+            
+            # Réduire la résolution pour la couche suivante
+            if layer_id < num_layers - 1:
+                h, w = current_shape
+                new_h = max(8, int(h * reduction_factor))
+                new_w = max(8, int(w * reduction_factor))
+                current_shape = (new_h, new_w)
+        
+        # Statistiques
+        self._frame_count = 0
+        self._propagation_enabled = True
+    
+    @property
+    def layers(self) -> list[NeuronLayer]:
+        """Accès aux couches."""
+        return self._layers
+    
+    def get_layer(self, layer_id: int) -> NeuronLayer:
+        """Récupère une couche par son ID."""
+        if 0 <= layer_id < len(self._layers):
+            return self._layers[layer_id]
+        raise IndexError(f"Layer {layer_id} not found (0-{len(self._layers)-1})")
+    
+    @property
+    def total_neurons(self) -> int:
+        """Nombre total de neurones dans toutes les couches."""
+        return sum(layer.neuron_count for layer in self._layers)
+    
+    def process(
+        self,
+        input_pattern: np.ndarray,
+        propagate: bool = True
+    ) -> list[np.ndarray]:
+        """Traite une entrée à travers toutes les couches.
+        
+        Args:
+            input_pattern: Pattern d'activation de l'entrée (H, W) booléen
+            propagate: Si True, propage vers les couches supérieures
+            
+        Returns:
+            Liste des sorties de chaque couche
+        """
+        self._frame_count += 1
+        outputs = []
+        
+        current_input = input_pattern
+        
+        for layer_idx, layer in enumerate(self._layers):
+            # Adapter la taille si nécessaire
+            if current_input.shape != layer.shape:
+                current_input = self._resize_pattern(
+                    current_input, layer.shape
+                )
+            
+            # Traiter la couche
+            output = layer.process(current_input)
+            outputs.append(output)
+            
+            # Préparer l'entrée pour la couche suivante
+            if propagate and layer_idx < len(self._layers) - 1:
+                current_input = output
+        
+        return outputs
+    
+    def _resize_pattern(
+        self,
+        pattern: np.ndarray,
+        target_shape: tuple[int, int]
+    ) -> np.ndarray:
+        """Redimensionne un pattern booléen vers une nouvelle taille.
+        
+        Utilise un pooling ou upsampling selon le rapport de tailles.
+        """
+        src_h, src_w = pattern.shape
+        dst_h, dst_w = target_shape
+        
+        if (src_h, src_w) == (dst_h, dst_w):
+            return pattern
+        
+        # Convertir en float pour le redimensionnement
+        pattern_float = pattern.astype(np.float32)
+        
+        # Calculer les ratios
+        h_ratio = src_h / dst_h
+        w_ratio = src_w / dst_w
+        
+        # Créer la sortie
+        output = np.zeros(target_shape, dtype=bool)
+        
+        for y in range(dst_h):
+            for x in range(dst_w):
+                # Région source correspondante
+                src_y1 = int(y * h_ratio)
+                src_y2 = min(src_h, int((y + 1) * h_ratio) + 1)
+                src_x1 = int(x * w_ratio)
+                src_x2 = min(src_w, int((x + 1) * w_ratio) + 1)
+                
+                # Max pooling (un pixel actif = région active)
+                region = pattern[src_y1:src_y2, src_x1:src_x2]
+                output[y, x] = np.any(region)
+        
+        return output
+    
+    def create_neurons_from_patterns(
+        self,
+        layer_id: int,
+        patterns: list[TemporalPattern]
+    ) -> list[Neuron]:
+        """Crée des neurones dans une couche à partir de patterns.
+        
+        Args:
+            layer_id: Couche cible
+            patterns: Liste de patterns stables
+            
+        Returns:
+            Liste des neurones créés
+        """
+        layer = self.get_layer(layer_id)
+        created = []
+        
+        for pattern in patterns:
+            neuron = layer.create_neuron_from_pattern(pattern)
+            if neuron is not None:
+                created.append(neuron)
+        
+        return created
+    
+    def get_all_active_neurons(self) -> dict[int, list[Neuron]]:
+        """Retourne tous les neurones qui ont spiké récemment.
+        
+        Returns:
+            {layer_id: [neurons qui ont spiké]}
+        """
+        active = {}
+        for layer in self._layers:
+            active_in_layer = [
+                n for n in layer.neurons
+                if n.last_spike_frame == layer._frame_count
+            ]
+            if active_in_layer:
+                active[layer.layer_id] = active_in_layer
+        return active
+    
+    def get_stats(self) -> dict:
+        """Statistiques globales de la pile."""
+        layer_stats = [layer.get_stats() for layer in self._layers]
+        return {
+            'num_layers': self.num_layers,
+            'total_neurons': self.total_neurons,
+            'frame_count': self._frame_count,
+            'layers': layer_stats,
+            'neurons_per_layer': [s['neuron_count'] for s in layer_stats],
+            'spikes_per_layer': [s['total_spikes'] for s in layer_stats],
+        }
+    
+    def reset(self):
+        """Réinitialise l'état de tous les neurones."""
+        for layer in self._layers:
+            layer.reset()
+    
+    def clear(self):
+        """Supprime tous les neurones de toutes les couches."""
+        for layer in self._layers:
+            layer.clear()
+        self._frame_count = 0
+
+
+def visualize_stack(
+    stack: NeuronStack,
+    show_potentials: bool = True,
+    max_width: int = 800
+) -> np.ndarray:
+    """Visualise toutes les couches d'une pile.
+    
+    Affiche les couches empilées verticalement avec la couche 0 en bas.
+    
+    Args:
+        stack: Pile de neurones
+        show_potentials: Afficher les potentiels
+        max_width: Largeur maximale de l'image
+        
+    Returns:
+        Image RGB (H, W, 3) uint8
+    """
+    import cv2
+    
+    visualizations = []
+    
+    # Visualiser chaque couche (de haut en bas = N à 0)
+    for layer in reversed(stack.layers):
+        viz = visualize_neurons(layer, show_potentials)
+        
+        # Redimensionner pour la largeur max
+        h, w = viz.shape[:2]
+        if w < max_width:
+            scale = max_width / w
+            new_h = int(h * scale)
+            viz = cv2.resize(viz, (max_width, new_h), interpolation=cv2.INTER_NEAREST)
+        
+        # Ajouter un label
+        label_h = 20
+        labeled = np.zeros((viz.shape[0] + label_h, viz.shape[1], 3), dtype=np.uint8)
+        labeled[label_h:, :, :] = viz
+        
+        # Texte du label
+        cv2.putText(
+            labeled, 
+            f"Layer {layer.layer_id}: {layer.neuron_count} neurons, {layer.shape}",
+            (5, 15), 
+            cv2.FONT_HERSHEY_SIMPLEX, 
+            0.4, 
+            (200, 200, 200), 
+            1
+        )
+        
+        visualizations.append(labeled)
+    
+    # Empiler verticalement
+    return np.vstack(visualizations)
+
