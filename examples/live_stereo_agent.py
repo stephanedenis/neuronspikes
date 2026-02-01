@@ -1689,16 +1689,31 @@ def draw_polar_channels(
     Returns:
         Image BGR de la visualisation
     """
-    # Récupérer les données polaires
+    # Vérifier que c'est une ColorFovea avec les attributs nécessaires
+    if not hasattr(fovea, '_luma'):
+        # Fovea standard sans canaux couleur
+        shape = (fovea.config.num_rings, fovea.config.num_sectors)
+        viz = np.zeros((size, size, 3), dtype=np.uint8)
+        cv2.putText(viz, "Mode Grayscale", (10, size//2 - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        cv2.putText(viz, f"Fovea {label}", (10, size//2 + 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        return viz
+    
+    # Récupérer les données polaires de ColorFovea
     luma = fovea._luma
     chroma_u = fovea._chroma_u
     chroma_v = fovea._chroma_v
     motion = fovea._motion_mag
     alpha = fovea._alpha
     
-    # Saillance polaire si disponible
-    saliency_key = f'{label.lower()}_saliency_polar'
-    saliency = result.get(saliency_key, None)
+    # Saillance polaire si disponible (structure: result['polar_saliency']['left'/'right'])
+    polar_saliency = result.get('polar_saliency')
+    if polar_saliency is not None:
+        saliency_key = 'left' if label.upper() == 'L' else 'right'
+        saliency = polar_saliency.get(saliency_key)
+    else:
+        saliency = None
     if saliency is None:
         saliency = np.zeros_like(luma)
     
@@ -2356,9 +2371,6 @@ def main():
             # Visualisation du NeuronStack (carré)
             stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=panel_size)
             
-            # Visualisation des voies rétiniennes bio-inspirées (carré)
-            retinal_viz = draw_retinal_pathways(result.get('retinal_result'), size=panel_size)
-            
             # Carte de corrélation ou disparité (carrée)
             correlation_viz = draw_correlation_map(
                 result['left_act'], result['right_act'], 
@@ -2374,12 +2386,11 @@ def main():
             right_cam_resized = cv2.resize(right_viz, (half_width, cam_height))
             
             # Ligne 2: Panneaux L+R appairés (45% hauteur)
-            # Layout: [Fovea_L][Canaux_L][Corr][Stack][Retinal][Canaux_R][Fovea_R]
-            # Mais on veut L+R côte à côte, donc:
-            # [Fovea_L | Fovea_R] [Canaux_L | Canaux_R] [Corr] [Stack] [Retinal]
+            # Layout: [Fovea L|R] [Canaux L|R] [Corr/Disp] [NeuronStack]
+            # NOTE: RETINAL supprimé car redondant avec saillance polaire ColorFovea
             
-            # Calculer les largeurs pour 5 groupes
-            num_groups = 5
+            # Calculer les largeurs pour 4 groupes
+            num_groups = 4
             group_width = screen_width // num_groups
             
             # Créer les paires L+R côte à côte (carrées, centrées dans leur groupe)
@@ -2415,15 +2426,14 @@ def main():
                 
                 return canvas
             
-            # Créer les 5 groupes
+            # Créer les 4 groupes (sans RETINAL)
             fovea_pair = make_pair(left_fovea_viz, right_fovea_viz, group_width, panel_row_height)
             channels_pair = make_pair(left_channels, right_channels, group_width, panel_row_height)
             corr_single = make_single(correlation_viz, group_width, panel_row_height)
             stack_single = make_single(stack_viz, group_width, panel_row_height)
-            retinal_single = make_single(retinal_viz, group_width, panel_row_height)
             
-            # Assembler la rangée de panneaux
-            panels_row = np.hstack([fovea_pair, channels_pair, corr_single, stack_single, retinal_single])
+            # Assembler la rangée de panneaux (4 groupes)
+            panels_row = np.hstack([fovea_pair, channels_pair, corr_single, stack_single])
             
             # Ajuster la largeur si nécessaire
             if panels_row.shape[1] != screen_width:
@@ -2436,8 +2446,8 @@ def main():
             # === OVERLAY D'INFORMATION ===
             font = cv2.FONT_HERSHEY_SIMPLEX
             
-            # Labels des panneaux
-            labels = ["FOVEA L|R", "CANAUX L|R", "CORR/DISP", "NEURONS", "RETINAL"]
+            # Labels des panneaux (4 groupes)
+            labels = ["FOVEA L|R", "CANAUX L|R", "CORR/DISP", "NEURONS"]
             for i, label in enumerate(labels):
                 x = i * group_width + group_width // 2 - len(label) * 4
                 cv2.putText(display, label, (x, cam_height + 18),
