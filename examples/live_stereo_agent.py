@@ -1592,6 +1592,227 @@ class OculomotorState:
         return tuple(deltas)
 
 
+def draw_polar_channels(
+    fovea: ColorFovea,
+    result: dict,
+    size: int = 180,
+    label: str = "L"
+) -> np.ndarray:
+    """Visualise les canaux polaires d'une ColorFovea.
+    
+    Affiche une grille 2×3 avec:
+    - Luma (luminance Y)
+    - Chroma U (bleu-jaune)  
+    - Chroma V (rouge-cyan)
+    - Motion magnitude
+    - Saillance polaire
+    - Alpha (couverture)
+    
+    Args:
+        fovea: ColorFovea échantillonnée
+        result: Dictionnaire de process() de l'agent
+        size: Taille totale de la visualisation
+        label: Label "L" ou "R" pour gauche/droite
+        
+    Returns:
+        Image BGR de la visualisation
+    """
+    # Récupérer les données polaires
+    luma = fovea._luma
+    chroma_u = fovea._chroma_u
+    chroma_v = fovea._chroma_v
+    motion = fovea._motion_mag
+    alpha = fovea._alpha
+    
+    # Saillance polaire si disponible
+    saliency_key = f'{label.lower()}_saliency_polar'
+    saliency = result.get(saliency_key, None)
+    if saliency is None:
+        saliency = np.zeros_like(luma)
+    
+    # Dimensions de la grille: 2 lignes × 3 colonnes
+    cell_w = size // 3
+    cell_h = size // 2
+    viz = np.zeros((size, size, 3), dtype=np.uint8)
+    
+    def polar_to_img(data, cmap='gray', vmin=None, vmax=None):
+        """Convertit données polaires en image colorée."""
+        if vmin is None:
+            vmin = data.min()
+        if vmax is None:
+            vmax = data.max()
+        if vmax <= vmin:
+            vmax = vmin + 1
+        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+        img = (normalized * 255).astype(np.uint8)
+        img = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+        if cmap == 'gray':
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif cmap == 'jet':
+            return cv2.applyColorMap(img, cv2.COLORMAP_JET)
+        elif cmap == 'hot':
+            return cv2.applyColorMap(img, cv2.COLORMAP_HOT)
+        elif cmap == 'cool':
+            return cv2.applyColorMap(img, cv2.COLORMAP_COOL)
+        else:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    
+    # Ligne 1: Luma, Chroma U, Chroma V
+    viz[0:cell_h, 0:cell_w] = polar_to_img(luma, 'gray', 0, 255)
+    viz[0:cell_h, cell_w:2*cell_w] = polar_to_img(chroma_u, 'cool', 0, 255)
+    viz[0:cell_h, 2*cell_w:3*cell_w] = polar_to_img(chroma_v, 'hot', 0, 255)
+    
+    # Ligne 2: Motion, Saillance, Alpha
+    viz[cell_h:2*cell_h, 0:cell_w] = polar_to_img(motion, 'jet', 0, motion.max() + 1)
+    viz[cell_h:2*cell_h, cell_w:2*cell_w] = polar_to_img(saliency, 'hot', 0, 1)
+    viz[cell_h:2*cell_h, 2*cell_w:3*cell_w] = polar_to_img(alpha, 'gray', 0, 1)
+    
+    # Labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    labels = [('Y', 0, 0), ('U', cell_w, 0), ('V', 2*cell_w, 0),
+              ('M', 0, cell_h), ('S', cell_w, cell_h), ('α', 2*cell_w, cell_h)]
+    for txt, x, y in labels:
+        cv2.putText(viz, txt, (x + 2, y + 12), font, 0.35, (200, 200, 200), 1)
+    
+    # Label œil
+    cv2.putText(viz, label, (size - 15, 15), font, 0.5, (255, 255, 0), 1)
+    
+    # Bordures
+    cv2.line(viz, (cell_w, 0), (cell_w, size), (50, 50, 50), 1)
+    cv2.line(viz, (2*cell_w, 0), (2*cell_w, size), (50, 50, 50), 1)
+    cv2.line(viz, (0, cell_h), (size, cell_h), (50, 50, 50), 1)
+    
+    return viz
+
+
+def draw_correlation_map(
+    left_act: np.ndarray,
+    right_act: np.ndarray,
+    size: int = 180,
+    show_disparity: bool = False
+) -> np.ndarray:
+    """Visualise la corrélation ou disparité binoculaire.
+    
+    Args:
+        left_act: Activations œil gauche
+        right_act: Activations œil droit
+        size: Taille de l'image
+        show_disparity: True pour disparité, False pour corrélation
+        
+    Returns:
+        Image BGR
+    """
+    if show_disparity:
+        # Disparité = différence
+        data = left_act - right_act
+        data_norm = (data - data.min()) / (data.max() - data.min() + 1e-6)
+        viz = cv2.applyColorMap((data_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        viz = cv2.resize(viz, (size, size), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(viz, "Disp", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    else:
+        # Corrélation = produit
+        corr = left_act * right_act
+        corr_norm = corr / (corr.max() + 1e-6)
+        viz = np.zeros((size, size, 3), dtype=np.uint8)
+        h, w = corr_norm.shape
+        cell_h, cell_w = size // h, size // w
+        for i in range(h):
+            for j in range(w):
+                c = corr_norm[i, j]
+                color = (int(c * 100), int(c * 255), int(c * 200))
+                y1, y2 = i * cell_h, (i + 1) * cell_h
+                x1, x2 = j * cell_w, (j + 1) * cell_w
+                viz[y1:y2, x1:x2] = color
+        cv2.putText(viz, "Corr", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    
+    return viz
+
+
+def create_fullscreen_layout(
+    left_cam: np.ndarray,
+    right_cam: np.ndarray,
+    left_fovea_viz: np.ndarray,
+    right_fovea_viz: np.ndarray,
+    left_channels: np.ndarray,
+    right_channels: np.ndarray,
+    correlation_viz: np.ndarray,
+    stack_viz: np.ndarray,
+    retinal_viz: np.ndarray,
+    info_text: List[str],
+    target_width: int = 1920,
+    target_height: int = 1080
+) -> np.ndarray:
+    """Crée un layout optimisé pour plein écran.
+    
+    Layout:
+    ┌─────────────────────┬─────────────────────┐
+    │     Caméra L        │     Caméra R        │  (50% hauteur)
+    │   (avec overlay)    │   (avec overlay)    │
+    ├──────┬──────┬───────┼──────┬──────┬───────┤
+    │Fovea │Chan L│ Corr  │Stack │Retin │Fovea R│  (25% hauteur)
+    │  L   │      │       │      │      │       │
+    ├──────┴──────┴───────┼──────┴──────┴───────┤
+    │     Channels L      │     Channels R      │  (25% hauteur)
+    └─────────────────────┴─────────────────────┘
+    
+    Args:
+        Images et visualisations diverses
+        target_width, target_height: Dimensions cibles
+        
+    Returns:
+        Image BGR du layout complet
+    """
+    # Créer le canvas
+    display = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+    
+    # Dimensions des zones
+    cam_height = target_height // 2
+    panel_height = target_height // 4
+    half_width = target_width // 2
+    
+    # Ligne 1: Caméras stéréo (50% hauteur)
+    left_cam_resized = cv2.resize(left_cam, (half_width, cam_height))
+    right_cam_resized = cv2.resize(right_cam, (half_width, cam_height))
+    display[0:cam_height, 0:half_width] = left_cam_resized
+    display[0:cam_height, half_width:target_width] = right_cam_resized
+    
+    # Ligne 2: Panneaux de visualisation (25% hauteur)
+    # 6 panneaux de largeur égale
+    panel_width = target_width // 6
+    row2_y = cam_height
+    
+    # Redimensionner les panneaux
+    panels = [
+        left_fovea_viz,
+        left_channels,
+        correlation_viz,
+        stack_viz,
+        retinal_viz,
+        right_fovea_viz
+    ]
+    
+    for i, panel in enumerate(panels):
+        resized = cv2.resize(panel, (panel_width, panel_height))
+        x_start = i * panel_width
+        display[row2_y:row2_y + panel_height, x_start:x_start + panel_width] = resized
+    
+    # Ligne 3: Canaux polaires détaillés (25% hauteur)  
+    row3_y = cam_height + panel_height
+    left_ch_resized = cv2.resize(left_channels, (half_width, panel_height))
+    right_ch_resized = cv2.resize(right_channels, (half_width, panel_height))
+    display[row3_y:row3_y + panel_height, 0:half_width] = left_ch_resized
+    display[row3_y:row3_y + panel_height, half_width:target_width] = right_ch_resized
+    
+    # Ajouter texte d'info en overlay
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    y_offset = 20
+    for i, text in enumerate(info_text[:5]):  # Max 5 lignes
+        cv2.putText(display, text, (10, cam_height - 10 - (len(info_text[:5]) - i - 1) * 18),
+                   font, 0.5, (0, 255, 0), 1)
+    
+    return display
+
+
 # Persistance visuelle des états FIRING (au moins 2 frames écran)
 _neuron_display_state: dict = {}  # neuron_id -> (état affiché, compteur frames)
 
@@ -1962,24 +2183,40 @@ def main():
     
     window_name = "Stereo Agent"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # Démarrer en plein écran
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    
+    # Dimensions de l'écran (estimation, sera ajusté)
+    screen_width = 1920
+    screen_height = 1080
     
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Ignorer les clics en dehors de la zone caméra
+            cam_h = param.get('cam_height', screen_height // 2)
+            if y > cam_h:
+                return  # Clic dans les panneaux, ignorer
+            
             # Calculer la position dans l'une des vues
-            display_width = param['display_width']
-            half = display_width // 2
-            if x < half:
-                # Clic dans vue gauche - convertir en coordonnées image
-                scale = camera.half_width / half
-                real_x = x * scale
-                real_y = y * scale
+            half_w = param.get('half_width', screen_width // 2)
+            
+            # Convertir en coordonnées image
+            scale_x = camera.half_width / half_w
+            scale_y = camera.height / cam_h
+            
+            if x < half_w:
+                # Clic dans vue gauche
+                real_x = x * scale_x
             else:
-                real_x = (x - half) * (camera.half_width / half)
-                real_y = y * (camera.height / param['display_height'])
+                # Clic dans vue droite
+                real_x = (x - half_w) * scale_x
+            real_y = y * scale_y
             
             agent.force_saccade_to(real_x, real_y)
+            print(f"Saccade vers ({real_x:.0f}, {real_y:.0f})")
     
-    display_params = {'display_width': 1280, 'display_height': 360}
+    display_params = {'display_width': screen_width, 'display_height': screen_height // 2,
+                      'cam_height': screen_height // 2, 'half_width': screen_width // 2}
     cv2.setMouseCallback(window_name, mouse_callback, display_params)
     
     try:
@@ -2044,128 +2281,130 @@ def main():
                 vergence_correlation=verg_corr
             )
             
-            # Visualisation des fovéas
-            fovea_size = 180
-            left_fovea_viz = visualize_fovea(agent.left_fovea, size=fovea_size)
-            right_fovea_viz = visualize_fovea(agent.right_fovea, size=fovea_size)
+            # Visualisation des fovéas polaires
+            panel_size = 200
+            left_fovea_viz = visualize_fovea(agent.left_fovea, size=panel_size)
+            right_fovea_viz = visualize_fovea(agent.right_fovea, size=panel_size)
+            
+            # Visualisation des canaux polaires (si mode couleur)
+            if args.color:
+                left_channels = draw_polar_channels(agent.left_fovea, result, size=panel_size, label="L")
+                right_channels = draw_polar_channels(agent.right_fovea, result, size=panel_size, label="R")
+            else:
+                # En mode grayscale, montrer juste les activations
+                left_channels = np.zeros((panel_size, panel_size, 3), dtype=np.uint8)
+                right_channels = np.zeros((panel_size, panel_size, 3), dtype=np.uint8)
+                cv2.putText(left_channels, "Grayscale", (10, panel_size//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+                cv2.putText(right_channels, "Mode", (10, panel_size//2 + 20), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
             
             # Visualisation du NeuronStack
-            stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=fovea_size)
+            stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=panel_size)
             
             # Visualisation des voies rétiniennes bio-inspirées
-            retinal_viz = draw_retinal_pathways(result.get('retinal_result'), size=fovea_size)
+            retinal_viz = draw_retinal_pathways(result.get('retinal_result'), size=panel_size)
             
             # Carte de corrélation ou disparité
-            if show_disparity:
-                disparity = result['left_act'] - result['right_act']
-                disparity_norm = (disparity - disparity.min()) / (disparity.max() - disparity.min() + 1e-6)
-                analysis_viz = cv2.applyColorMap(
-                    (disparity_norm * 255).astype(np.uint8),
-                    cv2.COLORMAP_JET
-                )
-                analysis_viz = cv2.resize(analysis_viz, (fovea_size, fovea_size))
-            else:
-                corr = result['left_act'] * result['right_act']
-                corr_norm = corr / (corr.max() + 1e-6)
-                analysis_viz = np.zeros((fovea_size, fovea_size, 3), dtype=np.uint8)
-                h, w = corr_norm.shape
-                cell_h, cell_w = fovea_size // h, fovea_size // w
-                for i in range(h):
-                    for j in range(w):
-                        c = corr_norm[i, j]
-                        color = (int(c * 100), int(c * 255), int(c * 200))
-                        y1, y2 = i * cell_h, (i + 1) * cell_h
-                        x1, x2 = j * cell_w, (j + 1) * cell_w
-                        analysis_viz[y1:y2, x1:x2] = color
+            correlation_viz = draw_correlation_map(
+                result['left_act'], result['right_act'], 
+                size=panel_size, show_disparity=show_disparity
+            )
             
-            # Assembler l'affichage
-            # Redimensionner les images caméra
-            display_h = 360
-            scale = display_h / camera.height
-            display_w = int(camera.half_width * scale)
+            # === LAYOUT PLEIN ÉCRAN ===
+            # Ligne 1: Caméras stéréo (55% hauteur)
+            cam_height = int(screen_height * 0.55)
+            half_width = screen_width // 2
             
-            left_small = cv2.resize(left_viz, (display_w, display_h))
-            right_small = cv2.resize(right_viz, (display_w, display_h))
+            left_cam_resized = cv2.resize(left_viz, (half_width, cam_height))
+            right_cam_resized = cv2.resize(right_viz, (half_width, cam_height))
             
-            # Ligne 1: images stéréo
-            row1 = np.hstack([left_small, right_small])
+            # Ligne 2: 7 panneaux de visualisation (45% hauteur)
+            panel_row_height = screen_height - cam_height
+            num_panels = 7
+            panel_w = screen_width // num_panels
             
-            # Ligne 2: fovéas, analyse, neurones et voies rétiniennes
-            fovea_row = np.hstack([left_fovea_viz, analysis_viz, stack_viz, retinal_viz, right_fovea_viz])
-            # Redimensionner pour correspondre
-            fovea_row = cv2.resize(fovea_row, (row1.shape[1], fovea_size))
+            # Créer les 7 panneaux: Fovea L | Channels L | Corr | Stack | Retinal | Channels R | Fovea R
+            panels = [
+                cv2.resize(left_fovea_viz, (panel_w, panel_row_height)),
+                cv2.resize(left_channels, (panel_w, panel_row_height)),
+                cv2.resize(correlation_viz, (panel_w, panel_row_height)),
+                cv2.resize(stack_viz, (panel_w, panel_row_height)),
+                cv2.resize(retinal_viz, (panel_w, panel_row_height)),
+                cv2.resize(right_channels, (panel_w, panel_row_height)),
+                cv2.resize(right_fovea_viz, (panel_w, panel_row_height)),
+            ]
             
-            display = np.vstack([row1, fovea_row])
+            # Assembler le display
+            row1 = np.hstack([left_cam_resized, right_cam_resized])
+            row2 = np.hstack(panels)
+            # Ajuster la largeur de row2 si nécessaire
+            if row2.shape[1] != row1.shape[1]:
+                row2 = cv2.resize(row2, (row1.shape[1], panel_row_height))
             
-            # Ajouter les labels
+            display = np.vstack([row1, row2])
+            
+            # === OVERLAY D'INFORMATION ===
             font = cv2.FONT_HERSHEY_SIMPLEX
             
-            # Affichage FPS et GPU
+            # Infos en haut à gauche
             gpu_info = "GPU" if agent.opencl else "CPU"
-            cv2.putText(display, f"FPS: {fps:.1f} [{gpu_info}]", (10, display_h - 10),
-                       font, 0.5, (0, 255, 0), 1)
-            
-            # Temps GPU si disponible
-            if agent.gpu_time_ms > 0:
-                cv2.putText(display, f"Saliency: {agent.gpu_time_ms:.1f}ms", 
-                           (10, display_h - 25), font, 0.4, (180, 180, 180), 1)
+            cv2.putText(display, f"FPS: {fps:.1f} [{gpu_info}]", (10, 25),
+                       font, 0.6, (0, 255, 0), 2)
             
             state_text = "SACCADE" if result['in_saccade'] else ("FIXATION" if result['fixating'] else "POURSUITE")
-            cv2.putText(display, state_text, (display_w + 10, 25),
-                       font, 0.5, (255, 255, 255), 1)
+            state_color = (0, 200, 255) if result['in_saccade'] else ((0, 255, 0) if result['fixating'] else (255, 200, 0))
+            cv2.putText(display, state_text, (10, 55), font, 0.6, state_color, 2)
             
-            # Affichage du zoom et POIs
-            zoom_text = f"Zoom: {result['zoom_level']}/7 (x{result['zoom_scale']:.1f})"
-            cv2.putText(display, zoom_text, (display_w + 10, 45),
-                       font, 0.4, (200, 200, 100), 1)
-            
-            # Affichage vergence dynamique
+            # Infos en haut au centre
             verg = result['vergence_offset']
             verg_dir = "CONV" if verg > 0 else ("DIV" if verg < 0 else "PAR")
-            verg_text = f"Vergence: {verg_dir} {abs(verg):.1f}px"
-            cv2.putText(display, verg_text, (display_w + 100, 45),
-                       font, 0.4, (100, 200, 255), 1)
+            cv2.putText(display, f"Vergence: {verg_dir} {abs(verg):.1f}px", (half_width - 100, 25),
+                       font, 0.5, (100, 200, 255), 1)
+            
+            zoom_text = f"Zoom: {result['zoom_level']}/7 (x{result['zoom_scale']:.1f})"
+            cv2.putText(display, zoom_text, (half_width - 100, 50),
+                       font, 0.5, (200, 200, 100), 1)
+            
+            # Infos en haut à droite
+            neurons_text = f"Neurons: {result['stack_neurons']} P:{result['stack_patterns']}"
+            cv2.putText(display, neurons_text, (screen_width - 220, 25),
+                       font, 0.5, (255, 200, 100), 1)
             
             if result['num_pois'] > 0:
                 cv2.putText(display, f"POIs: {result['num_pois']}", 
-                           (display_w + 10, 65), font, 0.4, (100, 200, 100), 1)
+                           (screen_width - 220, 50), font, 0.5, (100, 200, 100), 1)
             
-            # Affichage des neurones créés dynamiquement
-            neurons_text = f"Neurons: {result['stack_neurons']} (P:{result['stack_patterns']} S:{result['stack_stable']})"
-            cv2.putText(display, neurons_text, (display_w + 120, 65),
-                       font, 0.4, (255, 200, 100), 1)
-            
-            # Affichage mémoire saccadique et effort musculaire
-            saccade_stats = result.get('saccade_memory_stats', {})
-            mem_text = f"SacMem: {saccade_stats.get('num_memories', 0)} Effort: {result.get('motor_effort', 0):.2f}"
-            cv2.putText(display, mem_text, (display_w + 10, 105),
-                       font, 0.4, (200, 150, 255), 1)
-            
-            # Affichage infos couleur et mouvement (si mode couleur)
+            # Mouvement (si mode couleur)
             if args.color and result['left_motion'] is not None:
                 motion = result['left_motion']
                 motion_text = f"Motion: {motion.magnitude:.1f}px @{math.degrees(motion.direction):.0f}°"
-                cv2.putText(display, motion_text, (display_w + 10, 85),
-                           font, 0.4, (100, 150, 255), 1)
-            elif args.color:
-                cv2.putText(display, "Motion: --", (display_w + 10, 85),
-                           font, 0.4, (100, 150, 255), 1)
+                cv2.putText(display, motion_text, (10, 85),
+                           font, 0.5, (100, 150, 255), 1)
             
-            # Indicateur mode couleur
-            if args.color:
-                cv2.putText(display, "COLOR", (display_w - 100, display_h - 10),
-                           font, 0.5, (100, 200, 255), 1)
-            
-            # Historique de corrélation
-            if len(agent.correlation_history) > 10:
-                avg_corr = np.mean(agent.correlation_history[-10:])
-                cv2.putText(display, f"Corr moy: {avg_corr:.2f}", 
-                           (display_w + 10, display_h - 10),
+            # Labels des panneaux (en bas)
+            labels = ["FOVEA L", "CANAUX L", "CORR/DISP", "NEURONS", "RETINAL", "CANAUX R", "FOVEA R"]
+            for i, label in enumerate(labels):
+                x = i * panel_w + panel_w // 2 - len(label) * 4
+                cv2.putText(display, label, (x, cam_height + 18),
                            font, 0.4, (200, 200, 200), 1)
             
+            # Mode couleur indicator
+            if args.color:
+                cv2.putText(display, "COLOR", (screen_width - 80, cam_height - 10),
+                           font, 0.6, (100, 200, 255), 2)
+            
+            # Corrélation moyenne
+            if len(agent.correlation_history) > 10:
+                avg_corr = np.mean(agent.correlation_history[-10:])
+                cv2.putText(display, f"Corr: {avg_corr:.2f}", 
+                           (half_width + 50, 50), font, 0.5, (200, 200, 200), 1)
+            
             cv2.imshow(window_name, display)
-            display_params['display_width'] = row1.shape[1]
-            display_params['display_height'] = display_h
+            display_params['display_width'] = screen_width
+            display_params['display_height'] = cam_height
+            display_params['cam_height'] = cam_height
+            display_params['half_width'] = half_width
             
             # Gestion des touches
             key = cv2.waitKey(1) & 0xFF
