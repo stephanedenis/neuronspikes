@@ -332,7 +332,7 @@ class NeuronVisualizer3D:
         self._draw_connections()
     
     def _draw_layer_plane(self, layer: NeuronLayer, y: float, color: Tuple[float, ...]):
-        """Dessine le plan d'une couche."""
+        """Dessine le contour d'une couche (sans remplissage)."""
         h, w = layer.shape
         scale = self.config.layer_scale
         
@@ -340,18 +340,11 @@ class NeuronVisualizer3D:
         half_w = (w / max(w, h)) * scale
         half_h = (h / max(w, h)) * scale
         
+        # Contour fin seulement
         glDisable(GL_LIGHTING)
+        glLineWidth(1.0)
         glBegin(GL_LINE_LOOP)
-        glColor4f(*color, 0.3)
-        glVertex3f(-half_w, y, -half_h)
-        glVertex3f(half_w, y, -half_h)
-        glVertex3f(half_w, y, half_h)
-        glVertex3f(-half_w, y, half_h)
-        glEnd()
-        
-        # Remplissage semi-transparent
-        glBegin(GL_QUADS)
-        glColor4f(*color, 0.1)
+        glColor4f(*color, 0.4)
         glVertex3f(-half_w, y, -half_h)
         glVertex3f(half_w, y, -half_h)
         glVertex3f(half_w, y, half_h)
