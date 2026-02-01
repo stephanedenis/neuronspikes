@@ -59,6 +59,9 @@ from neuronspikes import (
     NeuronStack,
     GenesisConfig,
     NeuronConfig,
+    # Voies rétiniennes bio-inspirées
+    RetinalProcessor,
+    PathwayConfig,
 )
 
 
@@ -313,6 +316,19 @@ class AttentionAgent:
             reduction_factor=0.5,
         )
         print(f"NeuronStack initialisé: {fovea_shape} → 4 couches")
+        
+        # Processeur rétinien bio-inspiré (Magno/Parvo/V1)
+        pathway_config = PathwayConfig(
+            magno_sigma=2.0,            # Grands champs récepteurs pour mouvement
+            magno_threshold=0.03,       # Sensible au mouvement
+            parvo_color_gain=1.5,       # Opposition couleur amplifiée
+            lateral_strength=0.4,       # Inhibition centre-surround
+            gabor_num_orientations=8,   # Détecteurs d'orientation
+            gabor_num_scales=2,         # 2 échelles (rapide)
+        )
+        self.retinal_processor = RetinalProcessor(pathway_config)
+        self.use_retinal_saliency = True  # Utiliser la saillance bio-inspirée
+        print(f"RetinalProcessor initialisé: Magno/Parvo + {8*2} filtres Gabor")
     
     def _build_cell_params(self):
         """Pré-calcule les paramètres des cellules pour OpenCL."""
@@ -423,12 +439,17 @@ class AttentionAgent:
         saliency_right: np.ndarray,
         threshold: float = 0.3,
         left_gray: np.ndarray = None,
-        right_gray: np.ndarray = None
+        right_gray: np.ndarray = None,
+        left_color: np.ndarray = None,
+        right_color: np.ndarray = None
     ) -> List[SaliencyPoint]:
         """Trouve les pics de saillance communs aux deux yeux.
         
         Priorise les zones TRÈS lumineuses (lumières, reflets).
         Calcule automatiquement la disparité si les deux images sont fournies.
+        
+        Si use_retinal_saliency=True, utilise le processeur rétinien bio-inspiré
+        qui combine mouvement (Magno), couleur (Parvo) et orientation (V1).
         
         Args:
             saliency_left: Carte de saillance gauche
@@ -436,6 +457,8 @@ class AttentionAgent:
             threshold: Seuil de détection
             left_gray: Image grayscale gauche pour détecter les lumières
             right_gray: Image grayscale droite pour détecter les lumières
+            left_color: Image couleur gauche (pour RetinalProcessor)
+            right_color: Image couleur droite (pour RetinalProcessor)
             
         Returns:
             Liste de points saillants
@@ -446,6 +469,41 @@ class AttentionAgent:
         
         peaks = []
         x_right_bright = None  # Position X dans l'image droite
+        
+        # Mode bio-inspiré: utiliser RetinalProcessor pour saillance avancée
+        if self.use_retinal_saliency and (left_color is not None or left_gray is not None):
+            # Choisir l'image source (préférer couleur)
+            source_left = left_color if left_color is not None else left_gray
+            source_right = right_color if right_color is not None else right_gray
+            
+            # Traiter avec le processeur rétinien (Magno/Parvo/V1)
+            result_left = self.retinal_processor.process(source_left)
+            
+            # Saillance bio-inspirée combinant mouvement, couleur et orientation
+            bio_saliency = result_left['saliency']
+            
+            # Stocker pour visualisation
+            self._last_retinal_result = result_left
+            
+            # Redimensionner à la taille de travail
+            bio_saliency_resized = cv2.resize(bio_saliency, (w, h))
+            
+            # Combiner avec la saillance par corrélation stéréo
+            # Saillance bio = bottom-up (ce qui attire l'attention)
+            # Saillance stéréo = top-down (ce qui est binoculairement pertinent)
+            combined_saliency = 0.6 * bio_saliency_resized + 0.4 * (saliency_left * saliency_right)
+            
+            # Détecter les pics dans la saillance combinée
+            for y in range(1, h - 1):
+                for x in range(1, w - 1):
+                    val = combined_saliency[y, x]
+                    if val > threshold * 0.5:  # Seuil plus bas car meilleure qualité
+                        # Vérifier si c'est un maximum local
+                        neighborhood = combined_saliency[y-1:y+2, x-1:x+2]
+                        if val >= neighborhood.max():
+                            real_x = x * scale_x
+                            real_y = y * scale_y
+                            peaks.append(SaliencyPoint(real_x, real_y, val * 1.2))  # Boost
         
         # PRIORITÉ 1: Détecter directement les zones très lumineuses
         if left_gray is not None:
@@ -487,20 +545,21 @@ class AttentionAgent:
                     x_right=x_right_bright
                 ))
         
-        # PRIORITÉ 2: Corrélation des cartes de saillance
-        combined = saliency_left * saliency_right
-        
-        # Trouver les maxima locaux
-        for y in range(1, h - 1):
-            for x in range(1, w - 1):
-                val = combined[y, x]
-                if val > threshold:
-                    # Vérifier si c'est un maximum local
-                    neighborhood = combined[y-1:y+2, x-1:x+2]
-                    if val >= neighborhood.max():
-                        real_x = x * scale_x
-                        real_y = y * scale_y
-                        peaks.append(SaliencyPoint(real_x, real_y, val))
+        # PRIORITÉ 2: Corrélation des cartes de saillance (si pas déjà fait)
+        if not self.use_retinal_saliency:
+            combined = saliency_left * saliency_right
+            
+            # Trouver les maxima locaux
+            for y in range(1, h - 1):
+                for x in range(1, w - 1):
+                    val = combined[y, x]
+                    if val > threshold:
+                        # Vérifier si c'est un maximum local
+                        neighborhood = combined[y-1:y+2, x-1:x+2]
+                        if val >= neighborhood.max():
+                            real_x = x * scale_x
+                            real_y = y * scale_y
+                            peaks.append(SaliencyPoint(real_x, real_y, val))
         
         # Trier par force et garder les meilleurs
         peaks.sort(key=lambda p: p.strength, reverse=True)
@@ -850,7 +909,9 @@ class AttentionAgent:
         
         # Trouver les pics de saillance communs
         saliency_peaks = self.find_saliency_peaks(
-            saliency_left, saliency_right, left_gray=left_gray, right_gray=right_gray
+            saliency_left, saliency_right, 
+            left_gray=left_gray, right_gray=right_gray,
+            left_color=left_color, right_color=right_color
         )
         
         # Mettre à jour la position du regard
@@ -1050,6 +1111,9 @@ class AttentionAgent:
             'stack_patterns': sum(stack_stats.get('patterns_per_layer', [])),
             'stack_stable': sum(stack_stats.get('stable_patterns_per_layer', [])),
             'stack_stats': stack_stats,
+            # Voies rétiniennes bio-inspirées
+            'retinal_result': getattr(self, '_last_retinal_result', None),
+            'use_retinal_saliency': self.use_retinal_saliency,
         }
     
     def force_saccade_to(self, x: float, y: float):
@@ -1651,6 +1715,97 @@ def draw_neuron_stack_2d(stack: NeuronStack, size: int = 180) -> np.ndarray:
     return viz
 
 
+def draw_retinal_pathways(retinal_result: dict, size: int = 180) -> np.ndarray:
+    """Visualise les voies rétiniennes bio-inspirées.
+    
+    Affiche 4 panneaux:
+    - Mouvement (Magno) en haut gauche
+    - Couleur R-G (Parvo) en haut droite
+    - Orientations (V1) en bas gauche
+    - Saillance combinée en bas droite
+    
+    Args:
+        retinal_result: Dictionnaire retourné par RetinalProcessor.process()
+        size: Taille de la visualisation en pixels
+        
+    Returns:
+        Image BGR de la visualisation
+    """
+    if retinal_result is None:
+        # Retourner une image vide avec message
+        viz = np.zeros((size, size, 3), dtype=np.uint8)
+        cv2.putText(viz, "Retinal OFF", (size//4, size//2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        return viz
+    
+    half = size // 2
+    viz = np.zeros((size, size, 3), dtype=np.uint8)
+    
+    def normalize_and_resize(arr, target_size):
+        """Normalise [0,1] et redimensionne."""
+        if arr is None:
+            return np.zeros((target_size, target_size), dtype=np.uint8)
+        arr = np.clip(arr, 0, None)
+        max_v = arr.max()
+        if max_v > 0:
+            arr = arr / max_v
+        return cv2.resize((arr * 255).astype(np.uint8), (target_size, target_size))
+    
+    # 1. Mouvement (Magno) - en cyan/magenta
+    motion = retinal_result.get('magno', {}).get('motion_inhibited', None)
+    if motion is not None:
+        motion_img = normalize_and_resize(motion, half)
+        # Colormap: cyan pour le mouvement
+        viz[0:half, 0:half, 0] = motion_img  # B
+        viz[0:half, 0:half, 1] = motion_img // 2  # G
+        viz[0:half, 0:half, 2] = 0  # R
+    cv2.putText(viz, "M", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 100), 1)
+    
+    # 2. Couleur R-G (Parvo) - en rouge/vert
+    rg = retinal_result.get('parvo', {}).get('red_green', None)
+    if rg is not None:
+        # R-G: positif = rouge, négatif = vert
+        rg_pos = np.clip(rg, 0, 1)
+        rg_neg = np.clip(-rg, 0, 1)
+        rg_pos_img = normalize_and_resize(rg_pos, half)
+        rg_neg_img = normalize_and_resize(rg_neg, half)
+        viz[0:half, half:size, 0] = 0  # B
+        viz[0:half, half:size, 1] = rg_neg_img  # G
+        viz[0:half, half:size, 2] = rg_pos_img  # R
+    cv2.putText(viz, "P", (half + 3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 200, 200), 1)
+    
+    # 3. Orientations (V1) - coloré par angle
+    energy = retinal_result.get('v1', {}).get('energy', None)
+    orientation = retinal_result.get('v1', {}).get('orientation', None)
+    if energy is not None and orientation is not None:
+        energy_img = normalize_and_resize(energy, half)
+        ori_img = cv2.resize(orientation, (half, half))
+        # Colormap HSV par orientation
+        hue = ((ori_img / np.pi) * 180).astype(np.uint8)
+        sat = np.ones_like(hue) * 255
+        val = energy_img
+        hsv = np.stack([hue, sat, val], axis=-1)
+        ori_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        viz[half:size, 0:half] = ori_bgr
+    cv2.putText(viz, "V1", (3, half + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 100, 200), 1)
+    
+    # 4. Saillance combinée - en jaune/orange
+    saliency = retinal_result.get('saliency', None)
+    if saliency is not None:
+        sal_img = normalize_and_resize(saliency, half)
+        # Jaune chaud
+        viz[half:size, half:size, 0] = sal_img // 4  # B
+        viz[half:size, half:size, 1] = sal_img * 3 // 4  # G
+        viz[half:size, half:size, 2] = sal_img  # R
+    cv2.putText(viz, "S", (half + 3, half + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 200, 255), 1)
+    
+    # Bordures entre les panneaux
+    viz[half-1:half+1, :] = 50
+    viz[:, half-1:half+1] = 50
+    
+    return viz
+
+
 def draw_agent_overlay(
     image: np.ndarray,
     gaze_x: float,
@@ -1902,6 +2057,9 @@ def main():
             # Visualisation du NeuronStack
             stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=fovea_size)
             
+            # Visualisation des voies rétiniennes bio-inspirées
+            retinal_viz = draw_retinal_pathways(result.get('retinal_result'), size=fovea_size)
+            
             # Carte de corrélation ou disparité
             if show_disparity:
                 disparity = result['left_act'] - result['right_act']
@@ -1937,8 +2095,8 @@ def main():
             # Ligne 1: images stéréo
             row1 = np.hstack([left_small, right_small])
             
-            # Ligne 2: fovéas, analyse et neurones
-            fovea_row = np.hstack([left_fovea_viz, analysis_viz, stack_viz, right_fovea_viz])
+            # Ligne 2: fovéas, analyse, neurones et voies rétiniennes
+            fovea_row = np.hstack([left_fovea_viz, analysis_viz, stack_viz, retinal_viz, right_fovea_viz])
             # Redimensionner pour correspondre
             fovea_row = cv2.resize(fovea_row, (row1.shape[1], fovea_size))
             
