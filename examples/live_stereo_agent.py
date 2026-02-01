@@ -55,6 +55,10 @@ from neuronspikes import (
     # Fovéa couleur avec mouvement
     ColorFovea,
     ColorFoveaConfig,
+    # Genèse dynamique de neurones
+    NeuronStack,
+    GenesisConfig,
+    NeuronConfig,
 )
 
 
@@ -275,6 +279,29 @@ class AttentionAgent:
         self.correlation_history: List[float] = []
         self.gpu_time_ms: float = 0.0
         self.vergence_history: List[float] = []
+        
+        # Pile de neurones pour genèse dynamique
+        # Entrée: activations de la fovéa (rings × sectors)
+        fovea_shape = (fovea_config.num_rings, fovea_config.num_sectors)
+        genesis_config = GenesisConfig(
+            min_pattern_confidence=0.7,
+            min_pattern_occurrences=10,
+            max_neurons_per_layer=200,
+            neuron_merge_threshold=0.6,
+        )
+        neuron_config = NeuronConfig(
+            threshold=0.6,
+            decay_rate=0.05,
+            refractory_period=3,
+        )
+        self.neuron_stack = NeuronStack(
+            base_shape=fovea_shape,
+            num_layers=4,
+            config=genesis_config,
+            neuron_config=neuron_config,
+            reduction_factor=0.5,
+        )
+        print(f"NeuronStack initialisé: {fovea_shape} → 4 couches")
     
     def _build_cell_params(self):
         """Pré-calcule les paramètres des cellules pour OpenCL."""
@@ -759,6 +786,12 @@ class AttentionAgent:
         self.prev_left_act = left_act.copy()
         self.prev_right_act = right_act.copy()
         
+        # Traitement par NeuronStack pour genèse dynamique
+        # Combiner les activations gauche/droite en pattern d'entrée
+        combined_act = (left_act + right_act) / 2.0
+        stack_outputs = self.neuron_stack.process(combined_act, learn=True)
+        stack_stats = self.neuron_stack.get_stats()
+        
         # Mettre à jour le zoom (transition lisse)
         self.attention.zoom.update()
         
@@ -786,6 +819,11 @@ class AttentionAgent:
             # Vergence dynamique
             'vergence_offset': self.vergence_offset,
             'vergence_velocity': self.vergence_velocity,
+            # NeuronStack - genèse dynamique
+            'stack_neurons': stack_stats['total_neurons'],
+            'stack_patterns': sum(stack_stats.get('patterns_per_layer', [])),
+            'stack_stable': sum(stack_stats.get('stable_patterns_per_layer', [])),
+            'stack_stats': stack_stats,
         }
     
     def force_saccade_to(self, x: float, y: float):
@@ -1148,6 +1186,11 @@ def main():
             if result['num_pois'] > 0:
                 cv2.putText(display, f"POIs: {result['num_pois']}", 
                            (display_w + 10, 65), font, 0.4, (100, 200, 100), 1)
+            
+            # Affichage des neurones créés dynamiquement
+            neurons_text = f"Neurons: {result['stack_neurons']} (P:{result['stack_patterns']} S:{result['stack_stable']})"
+            cv2.putText(display, neurons_text, (display_w + 120, 65),
+                       font, 0.4, (255, 200, 100), 1)
             
             # Affichage infos couleur et mouvement (si mode couleur)
             if args.color and result['left_motion'] is not None:
