@@ -70,6 +70,13 @@ __all__ = [
     "ColorFovea",
     "ObjectTracker",
     "visualize_color_fovea",
+    # Voies rétiniennes bio-inspirées
+    "PathwayConfig",
+    "MagnocellularPathway",
+    "ParvocellularPathway",
+    "LateralInhibition",
+    "GaborFilterBank",
+    "RetinalProcessor",
     # OpenCL Backend
     "OpenCLBackend",
     "get_opencl_backend",
@@ -98,6 +105,10 @@ from .attention import (
 from .color_fovea import (
     ColorChannel, ColorFoveaConfig, MotionVector,
     TrackedObject, ColorFovea, ObjectTracker, visualize_color_fovea
+)
+from .retinal_pathways import (
+    PathwayConfig, MagnocellularPathway, ParvocellularPathway,
+    LateralInhibition, GaborFilterBank, RetinalProcessor
 )
 from .opencl_backend import OpenCLBackend, get_opencl_backend, is_opencl_available, list_opencl_devices
 
