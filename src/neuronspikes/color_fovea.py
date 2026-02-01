@@ -445,6 +445,164 @@ class ColorFovea(Fovea):
             dy=dy_sum / total_weight * avg_mag
         )
 
+    def compute_saliency(
+        self,
+        weight_motion: float = 0.4,
+        weight_color: float = 0.25,
+        weight_edge: float = 0.2,
+        weight_center: float = 0.15,
+    ) -> NDArray[np.float32]:
+        """Calcule la saillance polaire bio-inspirée.
+        
+        Combine plusieurs canaux pour estimer l'importance de chaque cellule:
+        - Mouvement (voie Magnocellulaire): détection de changement
+        - Couleur (voie Parvocellulaire): opposition chromatique
+        - Bords: gradients de luminance entre cellules voisines
+        - Biais central: la fovéa centrale attire l'attention
+        
+        Args:
+            weight_motion: Poids du mouvement (défaut 0.4 - priorité survie)
+            weight_color: Poids de la saillance couleur (défaut 0.25)
+            weight_edge: Poids des bords/contrastes (défaut 0.2)
+            weight_center: Biais vers le centre fovéal (défaut 0.15)
+            
+        Returns:
+            Carte de saillance (num_rings × num_sectors), valeurs [0, 1]
+        """
+        num_rings, num_sectors = self._luma.shape
+        
+        # 1. SAILLANCE MOUVEMENT (Magno) - ce qui bouge attire l'attention
+        motion_sal = self._motion_mag.copy()
+        if motion_sal.max() > 0:
+            motion_sal = motion_sal / motion_sal.max()
+        
+        # 2. SAILLANCE COULEUR (Parvo) - opposition chromatique
+        # |chroma_u| + |chroma_v| = saturation approximative
+        color_sal = (np.abs(self._chroma_u) + np.abs(self._chroma_v)) / 256.0
+        if color_sal.max() > 0:
+            color_sal = color_sal / color_sal.max()
+        
+        # 3. SAILLANCE BORDS - gradients de luminance (centre-surround)
+        edge_sal = np.zeros_like(self._luma)
+        for ring in range(num_rings):
+            for sector in range(num_sectors):
+                center_val = self._luma[ring, sector]
+                # Voisins angulaires (même anneau)
+                s_prev = (sector - 1) % num_sectors
+                s_next = (sector + 1) % num_sectors
+                # Voisins radiaux (anneaux adjacent)
+                r_inner = max(0, ring - 1)
+                r_outer = min(num_rings - 1, ring + 1)
+                
+                neighbors = [
+                    self._luma[ring, s_prev],
+                    self._luma[ring, s_next],
+                    self._luma[r_inner, sector],
+                    self._luma[r_outer, sector],
+                ]
+                # Contraste = différence avec la moyenne des voisins
+                edge_sal[ring, sector] = abs(center_val - np.mean(neighbors))
+        
+        if edge_sal.max() > 0:
+            edge_sal = edge_sal / edge_sal.max()
+        
+        # 4. BIAIS CENTRAL - la fovéa (anneaux centraux) est privilégiée
+        center_sal = np.zeros_like(self._luma)
+        for ring in range(num_rings):
+            # Décroissance gaussienne depuis le centre
+            ring_weight = math.exp(-0.5 * (ring / (num_rings / 4)) ** 2)
+            center_sal[ring, :] = ring_weight
+        
+        # COMBINAISON PONDÉRÉE
+        saliency = (
+            weight_motion * motion_sal +
+            weight_color * color_sal +
+            weight_edge * edge_sal +
+            weight_center * center_sal
+        )
+        
+        # Masquer par alpha (ignorer les zones hors image)
+        saliency = saliency * self._alpha
+        
+        # Normaliser [0, 1]
+        if saliency.max() > 0:
+            saliency = saliency / saliency.max()
+        
+        return saliency.astype(np.float32)
+
+    def get_saliency_peaks(
+        self,
+        saliency: NDArray[np.float32] = None,
+        threshold: float = 0.5,
+        max_peaks: int = 5,
+    ) -> List[Tuple[int, int, float]]:
+        """Trouve les pics de saillance dans l'espace polaire.
+        
+        Args:
+            saliency: Carte de saillance (ou calcule automatiquement)
+            threshold: Seuil minimum de saillance
+            max_peaks: Nombre maximum de pics à retourner
+            
+        Returns:
+            Liste de (ring, sector, saliency_value) triée par saillance décroissante
+        """
+        if saliency is None:
+            saliency = self.compute_saliency()
+        
+        num_rings, num_sectors = saliency.shape
+        peaks = []
+        
+        for ring in range(num_rings):
+            for sector in range(num_sectors):
+                val = saliency[ring, sector]
+                if val < threshold:
+                    continue
+                
+                # Vérifier si c'est un maximum local (8-voisinage en polaire)
+                is_peak = True
+                for dr in [-1, 0, 1]:
+                    for ds in [-1, 0, 1]:
+                        if dr == 0 and ds == 0:
+                            continue
+                        nr = ring + dr
+                        ns = (sector + ds) % num_sectors
+                        if 0 <= nr < num_rings:
+                            if saliency[nr, ns] > val:
+                                is_peak = False
+                                break
+                    if not is_peak:
+                        break
+                
+                if is_peak:
+                    peaks.append((ring, sector, float(val)))
+        
+        # Trier par saillance décroissante et limiter
+        peaks.sort(key=lambda x: x[2], reverse=True)
+        return peaks[:max_peaks]
+
+    def polar_to_cartesian_offset(
+        self,
+        ring: int,
+        sector: int,
+    ) -> Tuple[float, float]:
+        """Convertit une position polaire en offset cartésien depuis le gaze.
+        
+        Args:
+            ring: Index de l'anneau
+            sector: Index du secteur
+            
+        Returns:
+            (dx, dy) offset depuis le point de fixation
+        """
+        cell = self.cells[ring][sector]
+        r = (cell.inner_radius + cell.outer_radius) / 2
+        angle = (cell.start_angle + cell.end_angle) / 2 + self.gaze.theta
+        
+        dx = r * math.cos(angle)
+        dy = r * math.sin(angle)
+        
+        return (dx, dy)
+
 
 class ObjectTracker:
     """Traqueur d'objets basé sur le mouvement et la couleur.

@@ -318,6 +318,8 @@ class AttentionAgent:
         print(f"NeuronStack initialisé: {fovea_shape} → 4 couches")
         
         # Processeur rétinien bio-inspiré (Magno/Parvo/V1)
+        # NOTE: Gardé pour visualisation, mais la saillance est maintenant
+        # calculée en coordonnées POLAIRES par ColorFovea.compute_saliency()
         pathway_config = PathwayConfig(
             magno_sigma=2.0,            # Grands champs récepteurs pour mouvement
             magno_threshold=0.03,       # Sensible au mouvement
@@ -327,8 +329,8 @@ class AttentionAgent:
             gabor_num_scales=2,         # 2 échelles (rapide)
         )
         self.retinal_processor = RetinalProcessor(pathway_config)
-        self.use_retinal_saliency = True  # Utiliser la saillance bio-inspirée
-        print(f"RetinalProcessor initialisé: Magno/Parvo + {8*2} filtres Gabor")
+        self.use_retinal_saliency = False  # Désactivé: utiliser ColorFovea.compute_saliency()
+        print(f"Saillance bio-inspirée: coordonnées POLAIRES via ColorFovea")
     
     def _build_cell_params(self):
         """Pré-calcule les paramètres des cellules pour OpenCL."""
@@ -448,20 +450,22 @@ class AttentionAgent:
         Priorise les zones TRÈS lumineuses (lumières, reflets).
         Calcule automatiquement la disparité si les deux images sont fournies.
         
-        Si use_retinal_saliency=True, utilise le processeur rétinien bio-inspiré
-        qui combine mouvement (Magno), couleur (Parvo) et orientation (V1).
+        NOTE: La saillance bio-inspirée fine (Magno/Parvo) est calculée
+        en coordonnées POLAIRES après l'échantillonnage fovéal via
+        ColorFovea.compute_saliency(). Ici on fait une détection globale
+        pour décider des saccades.
         
         Args:
-            saliency_left: Carte de saillance gauche
+            saliency_left: Carte de saillance gauche (image complète réduite)
             saliency_right: Carte de saillance droite
             threshold: Seuil de détection
             left_gray: Image grayscale gauche pour détecter les lumières
             right_gray: Image grayscale droite pour détecter les lumières
-            left_color: Image couleur gauche (pour RetinalProcessor)
-            right_color: Image couleur droite (pour RetinalProcessor)
+            left_color: Image couleur gauche (non utilisé ici, pour compat)
+            right_color: Image couleur droite (non utilisé ici, pour compat)
             
         Returns:
-            Liste de points saillants
+            Liste de points saillants en coordonnées image
         """
         h, w = saliency_left.shape
         scale_x = self.width / w
@@ -470,85 +474,25 @@ class AttentionAgent:
         peaks = []
         x_right_bright = None  # Position X dans l'image droite
         
-        # Mode bio-inspiré: utiliser RetinalProcessor pour saillance avancée
-        if self.use_retinal_saliency and (left_color is not None or left_gray is not None):
-            # Choisir l'image source (préférer couleur)
-            source_left = left_color if left_color is not None else left_gray
-            source_right = right_color if right_color is not None else right_gray
-            
-            # CORRECTION: Extraire une fenêtre autour du point de fixation actuel
-            # Plutôt que de traiter l'image complète, on simule la région rétinienne
-            gaze_x = int(self.gaze.x)
-            gaze_y = int(self.gaze.y)
-            
-            # Taille de la fenêtre rétinienne (2x le rayon max de la fovéa)
-            fovea_radius = int(self.config.max_radius * 1.5)
-            fovea_size = fovea_radius * 2
-            
-            # Bornes de la fenêtre (avec clipping)
-            img_h, img_w = source_left.shape[:2]
-            x1 = max(0, gaze_x - fovea_radius)
-            y1 = max(0, gaze_y - fovea_radius)
-            x2 = min(img_w, gaze_x + fovea_radius)
-            y2 = min(img_h, gaze_y + fovea_radius)
-            
-            # Extraire la région fovéale
-            fovea_region_left = source_left[y1:y2, x1:x2]
-            
-            # Traiter avec le processeur rétinien (Magno/Parvo/V1)
-            # Maintenant on traite SEULEMENT la région autour du regard
-            if fovea_region_left.size > 0 and fovea_region_left.shape[0] > 10 and fovea_region_left.shape[1] > 10:
-                result_left = self.retinal_processor.process(fovea_region_left)
-            else:
-                # Fallback: traiter l'image complète si région trop petite
-                result_left = self.retinal_processor.process(source_left)
-                x1, y1 = 0, 0
-                fovea_size = max(img_h, img_w)
-            
-            # Saillance bio-inspirée combinant mouvement, couleur et orientation
-            bio_saliency = result_left['saliency']
-            
-            # Stocker pour visualisation (avec offset pour savoir où c'est)
-            self._last_retinal_result = result_left
-            self._last_retinal_offset = (x1, y1)  # Offset de la région
-            
-            # La saillance est relative à la fenêtre fovéale
-            # On doit la mapper vers l'espace de l'image complète
-            fovea_h, fovea_w = bio_saliency.shape
-            
-            # Créer une carte de saillance vide pour l'image complète
-            full_bio_saliency = np.zeros((h, w), dtype=np.float32)
-            
-            # Mapper la région fovéale vers l'espace réduit
-            x1_small = int(x1 / scale_x)
-            y1_small = int(y1 / scale_y)
-            x2_small = int(x2 / scale_x)
-            y2_small = int(y2 / scale_y)
-            
-            # Redimensionner la saillance fovéale à la taille cible
-            target_w = max(1, x2_small - x1_small)
-            target_h = max(1, y2_small - y1_small)
-            bio_saliency_region = cv2.resize(bio_saliency, (target_w, target_h))
-            
-            # Insérer dans la carte complète
-            full_bio_saliency[y1_small:y1_small+target_h, x1_small:x1_small+target_w] = bio_saliency_region
-            
-            # Combiner avec la saillance par corrélation stéréo
-            # Saillance bio = bottom-up (ce qui attire l'attention dans la fovéa)
-            # Saillance stéréo = top-down (ce qui est binoculairement pertinent partout)
-            combined_saliency = 0.6 * full_bio_saliency + 0.4 * (saliency_left * saliency_right)
-            
-            # Détecter les pics dans la saillance combinée
-            for y in range(1, h - 1):
-                for x in range(1, w - 1):
-                    val = combined_saliency[y, x]
-                    if val > threshold * 0.5:  # Seuil plus bas car meilleure qualité
-                        # Vérifier si c'est un maximum local
-                        neighborhood = combined_saliency[y-1:y+2, x-1:x+2]
-                        if val >= neighborhood.max():
-                            real_x = x * scale_x
-                            real_y = y * scale_y
-                            peaks.append(SaliencyPoint(real_x, real_y, val * 1.2))  # Boost
+        # NOTE: La saillance bio-inspirée fine (Magno/Parvo) est maintenant
+        # calculée en coordonnées POLAIRES par ColorFovea.compute_saliency()
+        # après l'échantillonnage. Ici on fait une détection GLOBALE simple
+        # basée sur la corrélation stéréo pour décider des saccades.
+        
+        # Combiner les cartes de saillance gauche/droite (corrélation stéréo)
+        combined_saliency = saliency_left * saliency_right
+        
+        # Détecter les pics dans la saillance combinée
+        for y in range(1, h - 1):
+            for x in range(1, w - 1):
+                val = combined_saliency[y, x]
+                if val > threshold:
+                    # Vérifier si c'est un maximum local
+                    neighborhood = combined_saliency[y-1:y+2, x-1:x+2]
+                    if val >= neighborhood.max():
+                        real_x = x * scale_x
+                        real_y = y * scale_y
+                        peaks.append(SaliencyPoint(real_x, real_y, val))
         
         # PRIORITÉ 1: Détecter directement les zones très lumineuses
         if left_gray is not None:
@@ -589,22 +533,6 @@ class AttentionAgent:
                     age=0,
                     x_right=x_right_bright
                 ))
-        
-        # PRIORITÉ 2: Corrélation des cartes de saillance (si pas déjà fait)
-        if not self.use_retinal_saliency:
-            combined = saliency_left * saliency_right
-            
-            # Trouver les maxima locaux
-            for y in range(1, h - 1):
-                for x in range(1, w - 1):
-                    val = combined[y, x]
-                    if val > threshold:
-                        # Vérifier si c'est un maximum local
-                        neighborhood = combined[y-1:y+2, x-1:x+2]
-                        if val >= neighborhood.max():
-                            real_x = x * scale_x
-                            real_y = y * scale_y
-                            peaks.append(SaliencyPoint(real_x, real_y, val))
         
         # Trier par force et garder les meilleurs
         peaks.sort(key=lambda p: p.strength, reverse=True)
@@ -1062,6 +990,26 @@ class AttentionAgent:
         if len(self.correlation_history) > 100:
             self.correlation_history.pop(0)
         
+        # SAILLANCE BIO-INSPIRÉE en coordonnées POLAIRES
+        # Calculée APRÈS l'échantillonnage fovéal (ce qui est bio-fidèle)
+        if self.use_color and hasattr(self.left_fovea, 'compute_saliency'):
+            left_polar_saliency = self.left_fovea.compute_saliency()
+            right_polar_saliency = self.right_fovea.compute_saliency()
+            
+            # Trouver les pics de saillance en coordonnées polaires
+            left_peaks = self.left_fovea.get_saliency_peaks(left_polar_saliency)
+            right_peaks = self.right_fovea.get_saliency_peaks(right_polar_saliency)
+            
+            # Stocker pour visualisation et analyse
+            self._last_polar_saliency = {
+                'left': left_polar_saliency,
+                'right': right_polar_saliency,
+                'left_peaks': left_peaks,
+                'right_peaks': right_peaks,
+            }
+        else:
+            self._last_polar_saliency = None
+        
         # Combiner les cartes de saillance pour le système d'attention
         combined_saliency = (saliency_left + saliency_right) / 2
         
@@ -1156,7 +1104,9 @@ class AttentionAgent:
             'stack_patterns': sum(stack_stats.get('patterns_per_layer', [])),
             'stack_stable': sum(stack_stats.get('stable_patterns_per_layer', [])),
             'stack_stats': stack_stats,
-            # Voies rétiniennes bio-inspirées
+            # Saillance bio-inspirée POLAIRE (via ColorFovea)
+            'polar_saliency': self._last_polar_saliency,
+            # Voies rétiniennes (pour visualisation seulement)
             'retinal_result': getattr(self, '_last_retinal_result', None),
             'use_retinal_saliency': self.use_retinal_saliency,
         }
