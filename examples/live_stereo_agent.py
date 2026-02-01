@@ -69,6 +69,8 @@ class SaliencyPoint:
     y: float
     strength: float  # Force de la saillance (0-1)
     age: int = 0  # Nombre de frames depuis détection
+    # Position dans l'œil droit (peut différer à cause de la parallaxe)
+    x_right: float = None  # Si None, utilise x - vergence_offset
     
     def decay(self, factor: float = 0.95):
         """Décroissance de la saillance avec le temps."""
@@ -266,14 +268,18 @@ class AttentionAgent:
         self.vergence_velocity: float = 0.0  # Vélocité pour lissage
         self.vergence_min: float = -30.0   # Vergence max divergente
         self.vergence_max: float = 50.0    # Vergence max convergente (objets proches)
-        self.vergence_speed: float = 2.0   # Vitesse d'ajustement pixels/frame
+        self.vergence_speed: float = 3.0   # Vitesse d'ajustement pixels/frame (plus réactif)
         self.vergence_search_range: int = 10  # Plage de recherche pour optimisation
+        self.vergence_continuous: bool = True  # Mode vergence continue optimale
+        
+        # État proprioceptif des muscles oculaires
+        self.oculomotor = OculomotorState()
         
         # État
         self.autonomous = True
         self.frame_count = 0
         self.last_saccade_frame = 0
-        self.min_saccade_interval = 8  # Frames minimum entre saccades (plus réactif)
+        self.min_saccade_interval = 15  # Frames minimum entre saccades (plus stable)
         
         # Statistiques
         self.correlation_history: List[float] = []
@@ -381,14 +387,21 @@ class AttentionAgent:
         grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
         gradient = np.sqrt(grad_x**2 + grad_y**2)
         
+        # Saillance par luminosité (zones très brillantes = intéressantes)
+        brightness = gray.astype(np.float32) / 255.0
+        # Accentuer les zones très lumineuses (seuillage doux)
+        bright_mask = np.clip((brightness - 0.7) * 5.0, 0, 1)
+        
         # Saillance par mouvement
         if prev_gray is not None:
             motion = cv2.absdiff(gray, prev_gray).astype(np.float32)
         else:
             motion = np.zeros_like(gradient)
         
-        # Combiner (gradient + mouvement)
-        saliency = gradient * 0.6 + motion * 0.4
+        # Combiner (gradient 40% + luminosité 30% + mouvement 30%)
+        gradient_norm = gradient / (gradient.max() + 1e-6)
+        motion_norm = motion / (motion.max() + 1e-6)
+        saliency = gradient_norm * 0.4 + bright_mask * 0.3 + motion_norm * 0.3
         
         # Normaliser
         saliency = saliency / (saliency.max() + 1e-6)
@@ -403,27 +416,74 @@ class AttentionAgent:
         self, 
         saliency_left: np.ndarray,
         saliency_right: np.ndarray,
-        threshold: float = 0.3
+        threshold: float = 0.3,
+        left_gray: np.ndarray = None,
+        right_gray: np.ndarray = None
     ) -> List[SaliencyPoint]:
         """Trouve les pics de saillance communs aux deux yeux.
+        
+        Priorise les zones TRÈS lumineuses (lumières, reflets).
+        Calcule automatiquement la disparité si les deux images sont fournies.
         
         Args:
             saliency_left: Carte de saillance gauche
             saliency_right: Carte de saillance droite
             threshold: Seuil de détection
+            left_gray: Image grayscale gauche pour détecter les lumières
+            right_gray: Image grayscale droite pour détecter les lumières
             
         Returns:
             Liste de points saillants
         """
-        # Corrélation des cartes de saillance
-        # Les zones saillantes dans les deux yeux sont des candidats
-        combined = saliency_left * saliency_right
-        
-        h, w = combined.shape
+        h, w = saliency_left.shape
         scale_x = self.width / w
         scale_y = self.height / h
         
         peaks = []
+        x_right_bright = None  # Position X dans l'image droite
+        
+        # PRIORITÉ 1: Détecter directement les zones très lumineuses
+        if left_gray is not None:
+            # Réduire à la même taille que la saliency map
+            gray_left_small = cv2.resize(left_gray, (w, h))
+            
+            # Trouver le point le plus brillant dans l'image gauche
+            max_val_left = gray_left_small.max()
+            if max_val_left > 200:  # Seuil de luminosité élevée
+                max_loc_left = np.unravel_index(gray_left_small.argmax(), gray_left_small.shape)
+                y_bright, x_bright_left = max_loc_left
+                
+                # Si on a aussi l'image droite, trouver la lumière indépendamment
+                if right_gray is not None:
+                    gray_right_small = cv2.resize(right_gray, (w, h))
+                    max_val_right = gray_right_small.max()
+                    
+                    if max_val_right > 200:
+                        max_loc_right = np.unravel_index(gray_right_small.argmax(), gray_right_small.shape)
+                        y_bright_right, x_bright_right = max_loc_right
+                        
+                        # Position réelle dans l'image droite
+                        x_right_bright = x_bright_right * scale_x
+                        
+                        # Calculer la disparité pour info
+                        disparity_small = x_bright_left - x_bright_right
+                        disparity_full = disparity_small * scale_x
+                        self.vergence_offset = 0.8 * self.vergence_offset + 0.2 * disparity_full
+                
+                real_x = x_bright_left * scale_x
+                real_y = y_bright * scale_y
+                # Ajouter avec haute priorité ET la position droite
+                brightness_strength = max_val_left / 255.0
+                peaks.append(SaliencyPoint(
+                    x=real_x, 
+                    y=real_y, 
+                    strength=brightness_strength * 1.5, 
+                    age=0,
+                    x_right=x_right_bright
+                ))
+        
+        # PRIORITÉ 2: Corrélation des cartes de saillance
+        combined = saliency_left * saliency_right
         
         # Trouver les maxima locaux
         for y in range(1, h - 1):
@@ -582,10 +642,11 @@ class AttentionAgent:
     ) -> Optional[Tuple[float, float]]:
         """Décide de la prochaine action du regard.
         
-        Utilise le système d'attention avec:
-        - Inhibition de retour (évite les zones récemment visitées)
-        - Mémoire des positions (exploration vs exploitation)
-        - Zoom adaptatif
+        Mode "vergence optimale continue":
+        1. Priorité à la vergence: ne saccade que si corrélation OK (> 0.4)
+        2. Saccade vers le MEILLEUR point d'intérêt (pas aléatoire)
+        3. Long temps de fixation pour laisser la vergence s'optimiser
+        4. Construit une représentation d'ensemble par exploration méthodique
         
         Returns:
             Nouvelle cible (x, y) ou None si pas de mouvement
@@ -594,7 +655,7 @@ class AttentionAgent:
         if not self.autonomous:
             return None
         
-        # Pas de saccade trop fréquente
+        # Pas de saccade trop fréquente - laisser le temps à la vergence
         frames_since_saccade = self.frame_count - self.last_saccade_frame
         if frames_since_saccade < self.min_saccade_interval:
             return None
@@ -612,32 +673,62 @@ class AttentionAgent:
             current_saliency = saliency_peaks[0].strength
         self.attention.auto_zoom(correlation, current_saliency)
         
-        # Si faible corrélation ou en exploration, chercher nouvelle cible
-        if correlation < 0.3 or (self.gaze.is_fixating and self.gaze.fixation_time > 15):
-            if saliency_map is not None:
-                # Utiliser l'attention controller pour sélectionner la cible
-                # avec inhibition de retour
-                target = self.attention.select_next_target(saliency_map, correlation)
+        # MODE VERGENCE OPTIMALE CONTINUE:
+        # Ne saccade que si la vergence actuelle est bonne (corrélation haute)
+        # Sinon, rester sur place et laisser la vergence s'optimiser
+        
+        # Si corrélation trop faible, attendre que la vergence s'améliore
+        if correlation < 0.4:
+            # Rester sur place - la vergence va s'optimiser automatiquement
+            return None
+        
+        # Saccade seulement si:
+        # 1. Bonne corrélation (vergence OK)
+        # 2. Fixation assez longue (a bien exploré cette zone)
+        # 3. Il existe un meilleur point d'intérêt ailleurs
+        
+        min_fixation_for_saccade = 30  # ~1 seconde à 30fps
+        if not self.gaze.is_fixating or self.gaze.fixation_time < min_fixation_for_saccade:
+            return None
+        
+        # Chercher le meilleur point d'intérêt (pas inhibé)
+        if saliency_map is not None:
+            # Utiliser l'attention controller pour sélectionner la cible
+            # avec inhibition de retour (évite les zones déjà visitées)
+            target = self.attention.select_next_target(saliency_map, correlation)
+            
+            # Vérifier que c'est assez différent de la position actuelle
+            dist = math.sqrt(
+                (target[0] - self.gaze.x)**2 + 
+                (target[1] - self.gaze.y)**2
+            )
+            # Seuil de distance plus élevé pour éviter les micro-saccades
+            if dist > 60:
+                return target
+        elif saliency_peaks:
+            # Fallback: utiliser le meilleur pic non-inhibé
+            best_peak = None
+            best_score = -1
+            
+            for peak in saliency_peaks:
+                inhibition = self.attention.inhibition.get_inhibition_at(peak.x, peak.y)
+                # Score = saillance × (1 - inhibition)
+                score = peak.strength * (1 - inhibition)
                 
-                # Vérifier que c'est assez différent de la position actuelle
                 dist = math.sqrt(
-                    (target[0] - self.gaze.x)**2 + 
-                    (target[1] - self.gaze.y)**2
+                    (peak.x - self.gaze.x)**2 + 
+                    (peak.y - self.gaze.y)**2
                 )
-                if dist > 30:
-                    return target
-            elif saliency_peaks:
-                # Fallback: utiliser les pics si pas de carte
-                # mais moduler par l'inhibition
-                for peak in saliency_peaks:
-                    inhibition = self.attention.inhibition.get_inhibition_at(peak.x, peak.y)
-                    if inhibition < 0.5:  # Pas trop inhibé
-                        dist = math.sqrt(
-                            (peak.x - self.gaze.x)**2 + 
-                            (peak.y - self.gaze.y)**2
-                        )
-                        if dist > 30:
-                            return (peak.x, peak.y)
+                # Bonus pour les points distants (exploration)
+                if dist > 60:
+                    score *= 1.2
+                
+                if score > best_score and dist > 60:
+                    best_score = score
+                    best_peak = peak
+            
+            if best_peak is not None:
+                return (best_peak.x, best_peak.y)
         
         return None
     
@@ -698,11 +789,25 @@ class AttentionAgent:
         
         # Trouver les pics de saillance communs
         saliency_peaks = self.find_saliency_peaks(
-            saliency_left, saliency_right
+            saliency_left, saliency_right, left_gray=left_gray, right_gray=right_gray
         )
         
         # Mettre à jour la position du regard
         gaze_x, gaze_y = self.gaze.update()
+        
+        # Si on a détecté une lumière brillante, FORCER le regard dessus
+        if saliency_peaks and saliency_peaks[0].strength > 1.0:
+            # C'est une lumière (strength > 1.0 = brightness * 1.5 > 1.0)
+            bright_peak = saliency_peaks[0]
+            gaze_x = bright_peak.x
+            gaze_y = bright_peak.y
+            gaze_x_right = bright_peak.x_right if bright_peak.x_right is not None else gaze_x - self.vergence_offset
+            # Mettre à jour le contrôleur de gaze pour qu'il suive
+            self.gaze.x = gaze_x
+            self.gaze.y = gaze_y
+        else:
+            # Pas de lumière brillante, utiliser vergence normale
+            gaze_x_right = gaze_x - self.vergence_offset
         
         # Mettre à jour la vergence dynamique pour optimiser l'alignement
         if left_color is not None and right_color is not None:
@@ -710,10 +815,9 @@ class AttentionAgent:
         else:
             self.update_vergence(left_gray, right_gray, gaze_x, gaze_y)
         
-        # Positionner les fovéas avec vergence dynamique
-        vergence_offset = self.vergence_offset
-        self.left_fovea.set_gaze(gaze_x + vergence_offset, gaze_y)
-        self.right_fovea.set_gaze(gaze_x - vergence_offset, gaze_y)
+        # Positionner les fovéas - chaque œil regarde sa propre cible
+        self.left_fovea.set_gaze(gaze_x, gaze_y)
+        self.right_fovea.set_gaze(gaze_x_right, gaze_y)
         
         # Variables pour les résultats couleur
         left_color_data = None
@@ -738,7 +842,7 @@ class AttentionAgent:
             try:
                 left_act = self.opencl.polar_sample(
                     left_gray, 
-                    int(gaze_x + vergence_offset), 
+                    int(gaze_x), 
                     int(gaze_y),
                     self.cell_params,
                     self.config.num_rings,
@@ -786,6 +890,16 @@ class AttentionAgent:
         self.prev_left_act = left_act.copy()
         self.prev_right_act = right_act.copy()
         
+        # Mettre à jour l'état proprioceptif des muscles oculaires
+        self.oculomotor.update(
+            gaze_x, gaze_y,
+            self.vergence_offset,
+            self.width, self.height
+        )
+        
+        # Encoder l'état oculomoteur en spikes pour le réseau
+        oculomotor_spikes = self.oculomotor.to_spike_encoding(resolution=8)
+        
         # Traitement par NeuronStack pour genèse dynamique
         # Combiner les activations gauche/droite en pattern d'entrée
         combined_act = (left_act + right_act) / 2.0
@@ -797,6 +911,7 @@ class AttentionAgent:
         
         return {
             'gaze_x': gaze_x,
+            'gaze_x_right': gaze_x_right,  # Position indépendante œil droit
             'gaze_y': gaze_y,
             'left_act': left_act,
             'right_act': right_act,
@@ -819,6 +934,9 @@ class AttentionAgent:
             # Vergence dynamique
             'vergence_offset': self.vergence_offset,
             'vergence_velocity': self.vergence_velocity,
+            # Proprioception oculomoteur
+            'oculomotor_spikes': oculomotor_spikes,
+            'oculomotor_state': self.oculomotor,
             # NeuronStack - genèse dynamique
             'stack_neurons': stack_stats['total_neurons'],
             'stack_patterns': sum(stack_stats.get('patterns_per_layer', [])),
@@ -892,13 +1010,163 @@ class StereoCamera:
         self.cap.release()
 
 
+@dataclass
+class OculomotorState:
+    """État proprioceptif des muscles oculaires virtuels.
+    
+    Encode les positions et mouvements du regard comme des impulsions
+    pour le réseau de neurones. Fournit une rétroaction sensorielle
+    bio-inspirée.
+    
+    6 muscles par œil (comme chez l'humain):
+    - Droit médial/latéral: mouvement horizontal
+    - Droit supérieur/inférieur: mouvement vertical
+    - Oblique supérieur/inférieur: torsion (non simulé ici)
+    
+    Nous encodons:
+    - Position X, Y en coordonnées normalisées [-1, 1]
+    - Vélocité (dérivée de position)
+    - Vergence (différence entre les deux yeux)
+    """
+    # Positions normalisées [-1, 1]
+    left_x: float = 0.0
+    left_y: float = 0.0
+    right_x: float = 0.0
+    right_y: float = 0.0
+    
+    # Vélocités (dérivées)
+    vel_x: float = 0.0
+    vel_y: float = 0.0
+    vel_vergence: float = 0.0
+    
+    # Vergence (positif = convergent, négatif = divergent)
+    vergence: float = 0.0
+    
+    # Historique pour calcul de vélocité
+    _prev_x: float = field(default=0.0, repr=False)
+    _prev_y: float = field(default=0.0, repr=False)
+    _prev_vergence: float = field(default=0.0, repr=False)
+    
+    def update(
+        self,
+        gaze_x: float,
+        gaze_y: float,
+        vergence_offset: float,
+        frame_width: float,
+        frame_height: float
+    ):
+        """Met à jour l'état proprioceptif.
+        
+        Args:
+            gaze_x, gaze_y: Position du regard en pixels
+            vergence_offset: Offset de vergence en pixels
+            frame_width, frame_height: Dimensions de l'image
+        """
+        # Normaliser les positions [-1, 1]
+        center_x = frame_width / 2
+        center_y = frame_height / 2
+        
+        norm_x = (gaze_x - center_x) / center_x
+        norm_y = (gaze_y - center_y) / center_y
+        
+        # Vergence normalisée (typiquement [-0.1, 0.1])
+        norm_verg = vergence_offset / center_x
+        
+        # Calculer les vélocités
+        self.vel_x = norm_x - self._prev_x
+        self.vel_y = norm_y - self._prev_y
+        self.vel_vergence = norm_verg - self._prev_vergence
+        
+        # Mettre à jour les positions
+        self._prev_x = norm_x
+        self._prev_y = norm_y
+        self._prev_vergence = norm_verg
+        
+        # Positions des deux yeux
+        self.left_x = norm_x + norm_verg / 2
+        self.left_y = norm_y
+        self.right_x = norm_x - norm_verg / 2
+        self.right_y = norm_y
+        self.vergence = norm_verg
+    
+    def to_spike_encoding(self, resolution: int = 8) -> np.ndarray:
+        """Encode l'état en pattern de spikes.
+        
+        Utilise un encodage de population où chaque "muscle" est
+        représenté par plusieurs neurones avec des seuils différents.
+        
+        Args:
+            resolution: Nombre de neurones par dimension
+            
+        Returns:
+            Array de spikes (6 × resolution) pour:
+            [pos_x, pos_y, vel_x, vel_y, vergence, vel_vergence]
+        """
+        # 6 canaux × resolution neurones
+        spikes = np.zeros((6, resolution), dtype=np.float32)
+        
+        # Encodage de population: chaque neurone a un "seuil préféré"
+        thresholds = np.linspace(-1, 1, resolution)
+        sigma = 2.0 / resolution  # Largeur du champ récepteur gaussien
+        
+        values = [
+            (self.left_x + self.right_x) / 2,  # Position X moyenne
+            (self.left_y + self.right_y) / 2,  # Position Y moyenne
+            self.vel_x * 10,                    # Vélocité X (amplifié)
+            self.vel_y * 10,                    # Vélocité Y (amplifié)
+            self.vergence * 5,                  # Vergence (amplifié)
+            self.vel_vergence * 20,             # Vélocité vergence (amplifié)
+        ]
+        
+        for i, val in enumerate(values):
+            # Activation gaussienne centrée sur la valeur
+            val_clipped = np.clip(val, -1, 1)
+            spikes[i] = np.exp(-0.5 * ((thresholds - val_clipped) / sigma) ** 2)
+        
+        return spikes
+    
+    def get_motor_command_from_spikes(
+        self, 
+        motor_spikes: np.ndarray,
+        resolution: int = 8
+    ) -> Tuple[float, float, float]:
+        """Décode des spikes moteurs en commande de mouvement.
+        
+        Args:
+            motor_spikes: Array (3 × resolution) pour [dx, dy, d_vergence]
+            resolution: Nombre de neurones par dimension
+            
+        Returns:
+            (delta_x, delta_y, delta_vergence) normalisés [-1, 1]
+        """
+        thresholds = np.linspace(-1, 1, resolution)
+        
+        deltas = []
+        for i in range(min(3, motor_spikes.shape[0])):
+            # Décodage par moyenne pondérée
+            weights = motor_spikes[i]
+            if np.sum(weights) > 0.01:
+                delta = np.sum(weights * thresholds) / np.sum(weights)
+            else:
+                delta = 0.0
+            deltas.append(delta)
+        
+        while len(deltas) < 3:
+            deltas.append(0.0)
+            
+        return tuple(deltas)
+
+
+# Persistance visuelle des états FIRING (au moins 2 frames écran)
+_neuron_display_state: dict = {}  # neuron_id -> (état affiché, compteur frames)
+
 def draw_neuron_stack_2d(stack: NeuronStack, size: int = 180) -> np.ndarray:
     """Visualise le NeuronStack en 2D.
     
     Affiche chaque couche comme une grille avec:
-    - Neurones actifs en couleur vive
-    - Neurones dormants en gris
-    - Patterns en cours de détection en contour
+    - Bleu = neurone en activation (firing) - priorité haute, persiste 2 frames
+    - Rouge = neurone en inhibition (réfractaire)
+    - Vert = neurone normal (dormant)
     
     Args:
         stack: Le NeuronStack à visualiser
@@ -907,32 +1175,28 @@ def draw_neuron_stack_2d(stack: NeuronStack, size: int = 180) -> np.ndarray:
     Returns:
         Image BGR de la visualisation
     """
+    global _neuron_display_state
+    from neuronspikes.genesis import NeuronState
+    
     num_layers = stack.num_layers
     stats = stack.get_stats()
     
-    # Créer l'image
+    # Créer l'image (fond sombre)
     viz = np.zeros((size, size, 3), dtype=np.uint8)
+    viz[:] = (20, 20, 20)  # Fond gris foncé
     
     # Diviser verticalement par couches
     layer_height = size // num_layers
     
-    # Couleurs par couche
-    layer_colors = [
-        (100, 200, 255),  # Couche 0: Cyan
-        (100, 255, 150),  # Couche 1: Vert
-        (255, 200, 100),  # Couche 2: Orange
-        (255, 100, 200),  # Couche 3: Rose
-    ]
+    # Taille fixe des points - très petit
+    point_radius = 1
     
     for layer_idx, layer in enumerate(stack.layers):
         y_start = layer_idx * layer_height
         y_end = (layer_idx + 1) * layer_height
         
-        # Fond de la couche (gradient subtil)
-        base_color = layer_colors[layer_idx % len(layer_colors)]
-        for y in range(y_start, y_end):
-            intensity = 20 + 10 * (y - y_start) // layer_height
-            viz[y, :] = [intensity, intensity, intensity]
+        # Ligne de séparation entre couches
+        cv2.line(viz, (0, y_start), (size, y_start), (40, 40, 40), 1)
         
         # Dessiner les neurones
         h, w = layer.shape
@@ -949,37 +1213,53 @@ def draw_neuron_stack_2d(stack: NeuronStack, size: int = 180) -> np.ndarray:
                 px = int(cx * cell_w)
                 py = y_start + int(cy * cell_h)
                 
-                # Taille basée sur le RF
-                radius = max(2, int(math.sqrt(neuron._rf_size) * cell_w / w))
+                nid = neuron.neuron_id
                 
-                # Couleur basée sur l'état
-                from neuronspikes.genesis import NeuronState
-                if neuron.state == NeuronState.FIRING:
-                    color = (0, 255, 255)  # Jaune vif
-                    radius = int(radius * 1.5)
-                elif neuron.state == NeuronState.CHARGING:
-                    intensity = int(128 + neuron.potential * 127)
-                    color = (intensity, intensity, base_color[2])
-                elif neuron.state == NeuronState.REFRACTORY:
-                    color = (50, 50, 100)  # Bleu sombre
-                else:
-                    color = (80, 80, 80)  # Gris
+                # Gérer la persistance visuelle (priorité: FIRING > REFRACTORY > autres)
+                current_state = neuron.state
                 
-                cv2.circle(viz, (px, py), radius, color, -1)
+                # Si FIRING maintenant, enregistrer avec persistance de 2 frames
+                if current_state == NeuronState.FIRING:
+                    _neuron_display_state[nid] = ('FIRING', 2)
                 
-                # Contour pour mieux voir
-                cv2.circle(viz, (px, py), radius, base_color, 1)
+                # Récupérer l'état affiché (peut être persisté)
+                color = None
+                if nid in _neuron_display_state:
+                    display_state, remaining = _neuron_display_state[nid]
+                    if remaining > 0:
+                        # Utiliser l'état persisté (priorité bleu)
+                        if display_state == 'FIRING':
+                            color = (255, 50, 50)    # Bleu pur vif = activation
+                            _neuron_display_state[nid] = (display_state, remaining - 1)
+                    else:
+                        del _neuron_display_state[nid]
+                
+                # Si pas de couleur persistée, utiliser l'état réel
+                if color is None:
+                    if current_state == NeuronState.FIRING:
+                        color = (255, 50, 50)    # Bleu pur vif = activation
+                    elif current_state == NeuronState.REFRACTORY:
+                        color = (50, 50, 255)    # Rouge vif = inhibition
+                    elif current_state == NeuronState.CHARGING:
+                        # Dégradé cyan selon le potentiel
+                        intensity = int(150 + 105 * neuron.potential)
+                        color = (intensity, intensity, 50)
+                    else:  # DORMANT
+                        color = (50, 180, 50)    # Vert clair = normal
+                
+                # Point de taille fixe, sans contour
+                cv2.circle(viz, (px, py), point_radius, color, -1)
         
         # Label de la couche
-        label = f"L{layer_idx}: {len(neurons)}n"
-        cv2.putText(viz, label, (5, y_end - 5), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, base_color, 1)
+        label = f"L{layer_idx}:{len(neurons)}"
+        cv2.putText(viz, label, (3, y_end - 3), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
     
     # Stats globales en haut
     total_n = stats['total_neurons']
     patterns = sum(stats.get('patterns_per_layer', []))
-    cv2.putText(viz, f"N:{total_n} P:{patterns}", (size - 70, 12),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+    cv2.putText(viz, f"N:{total_n} P:{patterns}", (size - 65, 12),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.3, (200, 200, 200), 1)
     
     return viz
 
@@ -998,6 +1278,12 @@ def draw_agent_overlay(
 ) -> np.ndarray:
     """Dessine l'overlay de l'agent sur l'image."""
     img = image.copy()
+    
+    # LABEL BIEN VISIBLE pour identifier l'œil
+    eye_label = "GAUCHE" if is_left_eye else "DROITE"
+    label_color = (255, 100, 100) if is_left_eye else (100, 100, 255)  # Bleu gauche, Rouge droite
+    cv2.putText(img, eye_label, (img.shape[1] // 2 - 50, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 1.0, label_color, 2)
     
     gx, gy = int(gaze_x), int(gaze_y)
     
@@ -1022,7 +1308,12 @@ def draw_agent_overlay(
     
     # Points de saillance
     for i, peak in enumerate(saliency_peaks[:5]):
-        px, py = int(peak.x), int(peak.y)
+        # Utiliser x_right pour l'œil droit si disponible
+        if not is_left_eye and peak.x_right is not None:
+            px = int(peak.x_right)
+        else:
+            px = int(peak.x)
+        py = int(peak.y)
         radius = int(5 + peak.strength * 10)
         alpha = 0.3 + peak.strength * 0.5
         cv2.circle(img, (px, py), radius, (0, 0, 255), 1)
@@ -1044,10 +1335,15 @@ def draw_agent_overlay(
                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     
     # Indicateur de vergence (ligne horizontale montrant le décalage)
+    verg_y = bar_y + bar_height + 15
+    verg_center = bar_x + bar_width // 2
+    verg_scale = 2.0  # pixels par unité de vergence
+    
+    # Afficher la valeur numérique
+    cv2.putText(img, f"Verg: {vergence_offset:+.1f}px", (bar_x, verg_y + 5),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    
     if abs(vergence_offset) > 0.5:
-        verg_y = bar_y + bar_height + 15
-        verg_center = bar_x + bar_width // 2
-        verg_scale = 2.0  # pixels par unité de vergence
         verg_end = int(verg_center + vergence_offset * verg_scale * (1 if is_left_eye else -1))
         
         # Ligne de base
@@ -1172,7 +1468,7 @@ def main():
             vergence = result['vergence_offset']
             left_viz = draw_agent_overlay(
                 left, 
-                result['gaze_x'] + vergence,  # Position œil gauche
+                result['gaze_x'],  # Position œil gauche (directe)
                 result['gaze_y'],
                 config,
                 result['in_saccade'],
@@ -1184,7 +1480,7 @@ def main():
             )
             right_viz = draw_agent_overlay(
                 right,
-                result['gaze_x'] - vergence,  # Position œil droit
+                result['gaze_x_right'],  # Position œil droit (indépendante!)
                 result['gaze_y'],
                 config,
                 result['in_saccade'],

@@ -134,9 +134,15 @@ class TestNeuron:
         spiked = neuron.step(0.6, current_frame=1)
         
         assert spiked is True
-        assert neuron.state == NeuronState.REFRACTORY
+        # L'état FIRING est visible pendant 1 frame
+        assert neuron.state == NeuronState.FIRING
         assert neuron.total_spikes == 1
         assert neuron.potential == 0.0
+        
+        # Au step suivant, il passe en REFRACTORY
+        spiked = neuron.step(0.0, current_frame=2)
+        assert spiked is False
+        assert neuron.state == NeuronState.REFRACTORY
     
     def test_refractory_period(self):
         """Test de la période réfractaire."""
@@ -145,23 +151,32 @@ class TestNeuron:
         
         neuron = Neuron(neuron_id=0, layer=1, receptive_field=rf, config=config)
         
-        # Provoquer un spike
+        # Provoquer un spike - état FIRING visible
         neuron.step(0.6, current_frame=1)
-        assert neuron.state == NeuronState.REFRACTORY
+        assert neuron.state == NeuronState.FIRING
         
-        # Période réfractaire (ne peut pas spiker)
+        # Frame 2: transition FIRING -> REFRACTORY (compteur=3)
         spiked = neuron.step(1.0, current_frame=2)
         assert spiked is False
+        assert neuron.state == NeuronState.REFRACTORY
         
+        # Frame 3: REFRACTORY (compteur=2)
         spiked = neuron.step(1.0, current_frame=3)
         assert spiked is False
+        assert neuron.state == NeuronState.REFRACTORY
         
+        # Frame 4: REFRACTORY (compteur=1)
         spiked = neuron.step(1.0, current_frame=4)
         assert spiked is False
+        assert neuron.state == NeuronState.REFRACTORY
         
-        # Période finie, devrait pouvoir spiker
+        # Frame 5: REFRACTORY -> DORMANT (compteur=0)
+        spiked = neuron.step(1.0, current_frame=5)
+        assert spiked is False
         assert neuron.state == NeuronState.DORMANT
-        spiked = neuron.step(0.6, current_frame=5)
+        
+        # Frame 6: période finie, devrait pouvoir spiker
+        spiked = neuron.step(0.6, current_frame=6)
         assert spiked is True
     
     def test_reset(self):

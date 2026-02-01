@@ -134,6 +134,11 @@ class Neuron:
         Returns:
             True si le neurone a émis un spike
         """
+        # Transition FIRING -> REFRACTORY (après 1 frame visible)
+        if self.state == NeuronState.FIRING:
+            self.state = NeuronState.REFRACTORY
+            # Continue pour décrémenter le compteur ci-dessous
+        
         # Gestion de la période réfractaire
         if self.state == NeuronState.REFRACTORY:
             self.refractory_counter -= 1
@@ -151,14 +156,16 @@ class Neuron:
         # Vérifier le seuil
         if self.potential >= self.config.threshold:
             # SPIKE!
-            self.state = NeuronState.FIRING
             self.total_spikes += 1
             self.last_spike_frame = current_frame
             
-            # Reset et période réfractaire
+            # Reset et préparer la période réfractaire
             self.potential = 0.0
-            self.refractory_counter = self.config.refractory_period
-            self.state = NeuronState.REFRACTORY
+            self.refractory_counter = self.config.refractory_period + 1  # +1 pour le frame FIRING
+            
+            # L'état FIRING sera visible pendant ce frame
+            # Le prochain step() passera en REFRACTORY
+            self.state = NeuronState.FIRING
             
             return True
         
