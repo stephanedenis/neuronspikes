@@ -171,6 +171,73 @@ class ColorFovea(Fovea):
         
         # Frame courante
         self._current_frame: int = 0
+        
+        # === PRÉ-CALCUL COORDONNÉES ÉCHANTILLONNAGE (VECTORISÉ) ===
+        # Calculer les offsets relatifs pour chaque cellule une seule fois
+        self._precompute_sample_offsets()
+    
+    def _precompute_sample_offsets(self):
+        """Pré-calcule les offsets d'échantillonnage pour chaque cellule.
+        
+        Stocke les coordonnées polaires relatives (r, angle) pour éviter
+        de les recalculer à chaque frame. Utilise 1 point par cellule
+        (centre) pour la performance maximale.
+        """
+        num_rings = self.config.num_rings
+        num_sectors = self.config.num_sectors
+        
+        # Pour chaque cellule, stocker (r, angle) du centre
+        self._sample_r = np.zeros((num_rings, num_sectors), dtype=np.float32)
+        self._sample_angle = np.zeros((num_rings, num_sectors), dtype=np.float32)
+        
+        for ring_idx, ring in enumerate(self.cells):
+            for sector_idx, cell in enumerate(ring):
+                # Centre de la cellule
+                r = (cell.inner_radius + cell.outer_radius) / 2
+                angle = (cell.start_angle + cell.end_angle) / 2
+                self._sample_r[ring_idx, sector_idx] = r
+                self._sample_angle[ring_idx, sector_idx] = angle
+    
+    def _sample_vectorized(
+        self,
+        y_channel: NDArray,
+        u_channel: NDArray,
+        v_channel: NDArray,
+        cx: float,
+        cy: float,
+        theta: float
+    ) -> None:
+        """Échantillonnage vectorisé NumPy (TRÈS RAPIDE).
+        
+        Remplace les boucles Python par des opérations NumPy.
+        """
+        h, w = y_channel.shape
+        
+        # Appliquer rotation et translation à tous les points en une fois
+        angles = self._sample_angle + theta
+        x_coords = cx + self._sample_r * np.cos(angles)
+        y_coords = cy + self._sample_r * np.sin(angles)
+        
+        # Convertir en indices entiers
+        x_int = np.clip(x_coords.astype(np.int32), 0, w - 1)
+        y_int = np.clip(y_coords.astype(np.int32), 0, h - 1)
+        
+        # Masque de validité (pixels dans l'image)
+        valid_mask = (
+            (x_coords >= 0) & (x_coords < w) &
+            (y_coords >= 0) & (y_coords < h)
+        )
+        
+        # Échantillonner avec indexation avancée NumPy (VECTORISÉ)
+        self._luma[:] = y_channel[y_int, x_int].astype(np.float32)
+        self._chroma_u[:] = u_channel[y_int, x_int]
+        self._chroma_v[:] = v_channel[y_int, x_int]
+        self._alpha[:] = valid_mask.astype(np.float32)
+        
+        # Mettre à zéro les pixels hors limites
+        self._luma[~valid_mask] = 0.0
+        self._chroma_u[~valid_mask] = 0.0
+        self._chroma_v[~valid_mask] = 0.0
     
     @property
     def luma(self) -> NDArray[np.float32]:
@@ -239,26 +306,16 @@ class ColorFovea(Fovea):
         cx, cy = self.gaze.x, self.gaze.y
         theta = self.gaze.theta
         
-        # Échantillonner chaque cellule
-        for ring_idx, ring in enumerate(self.cells):
-            for sector_idx, cell in enumerate(ring):
-                # Échantillonner avec alpha
-                luma, u, v, alpha = self._sample_cell_color(
-                    y_channel, u_channel, v_channel,
-                    cell, cx, cy, theta, w, h
-                )
-                self._luma[ring_idx, sector_idx] = luma
-                self._chroma_u[ring_idx, sector_idx] = u
-                self._chroma_v[ring_idx, sector_idx] = v
-                self._alpha[ring_idx, sector_idx] = alpha
+        # === ÉCHANTILLONNAGE VECTORISÉ (RAPIDE) ===
+        self._sample_vectorized(y_channel, u_channel, v_channel, cx, cy, theta)
         
         # Synchroniser avec _activations de la classe parente pour visualize_fovea()
         # Normaliser luma (0-255) vers activations (0-1)
         self._activations = self._luma / 255.0
         
-        # Calculer le mouvement
+        # Calculer le mouvement (version optimisée)
         if compute_motion and len(self._luma_history) > 0:
-            self._compute_motion()
+            self._compute_motion_fast()
         
         # Ajouter à l'historique
         self._luma_history.append(self._luma.copy())
@@ -271,6 +328,28 @@ class ColorFovea(Fovea):
             'motion_mag': self._motion_mag.copy(),
             'motion_dir': self._motion_dir.copy(),
         }
+    
+    def _compute_motion_fast(self):
+        """Calcule le mouvement par différence temporelle (version rapide)."""
+        if len(self._luma_history) < 1:
+            return
+        
+        prev_luma = self._luma_history[-1]
+        
+        # Différence temporelle vectorisée
+        self._motion_mag = np.abs(self._luma - prev_luma)
+        
+        # Direction: approximation rapide par gradient sectoriel
+        # Shift circulaire pour comparer avec secteurs voisins
+        shifted = np.roll(prev_luma, 1, axis=1)
+        gradient = self._luma - shifted
+        
+        # Direction basée sur le signe du gradient
+        sector_angle = 2 * np.pi / self.config.num_sectors
+        self._motion_dir = np.sign(gradient) * sector_angle
+        
+        # Masquer les faibles mouvements
+        self._motion_dir[self._motion_mag < self.color_config.motion_threshold] = 0.0
     
     def _bgr_to_yuv(self, bgr: NDArray[np.uint8]) -> NDArray[np.uint8]:
         """Convertit BGR vers YUV."""
@@ -452,7 +531,7 @@ class ColorFovea(Fovea):
         weight_edge: float = 0.2,
         weight_center: float = 0.15,
     ) -> NDArray[np.float32]:
-        """Calcule la saillance polaire bio-inspirée.
+        """Calcule la saillance polaire bio-inspirée (VERSION VECTORISÉE).
         
         Combine plusieurs canaux pour estimer l'importance de chaque cellule:
         - Mouvement (voie Magnocellulaire): détection de changement
@@ -469,49 +548,41 @@ class ColorFovea(Fovea):
         Returns:
             Carte de saillance (num_rings × num_sectors), valeurs [0, 1]
         """
-        num_rings, num_sectors = self._luma.shape
+        num_rings = self.config.num_rings
         
         # 1. SAILLANCE MOUVEMENT (Magno) - ce qui bouge attire l'attention
         motion_sal = self._motion_mag.copy()
-        if motion_sal.max() > 0:
-            motion_sal = motion_sal / motion_sal.max()
+        max_motion = motion_sal.max()
+        if max_motion > 0:
+            motion_sal /= max_motion
         
         # 2. SAILLANCE COULEUR (Parvo) - opposition chromatique
-        # |chroma_u| + |chroma_v| = saturation approximative
         color_sal = (np.abs(self._chroma_u) + np.abs(self._chroma_v)) / 256.0
-        if color_sal.max() > 0:
-            color_sal = color_sal / color_sal.max()
+        max_color = color_sal.max()
+        if max_color > 0:
+            color_sal /= max_color
         
-        # 3. SAILLANCE BORDS - gradients de luminance (centre-surround)
-        edge_sal = np.zeros_like(self._luma)
-        for ring in range(num_rings):
-            for sector in range(num_sectors):
-                center_val = self._luma[ring, sector]
-                # Voisins angulaires (même anneau)
-                s_prev = (sector - 1) % num_sectors
-                s_next = (sector + 1) % num_sectors
-                # Voisins radiaux (anneaux adjacent)
-                r_inner = max(0, ring - 1)
-                r_outer = min(num_rings - 1, ring + 1)
-                
-                neighbors = [
-                    self._luma[ring, s_prev],
-                    self._luma[ring, s_next],
-                    self._luma[r_inner, sector],
-                    self._luma[r_outer, sector],
-                ]
-                # Contraste = différence avec la moyenne des voisins
-                edge_sal[ring, sector] = abs(center_val - np.mean(neighbors))
+        # 3. SAILLANCE BORDS - gradients vectorisés (centre-surround)
+        # Voisins angulaires via roll
+        luma = self._luma
+        s_prev = np.roll(luma, 1, axis=1)
+        s_next = np.roll(luma, -1, axis=1)
+        # Voisins radiaux via padding + slicing
+        r_inner = np.vstack([luma[0:1, :], luma[:-1, :]])  # anneau 0 -> lui-même
+        r_outer = np.vstack([luma[1:, :], luma[-1:, :]])   # dernier -> lui-même
+        # Moyenne des 4 voisins
+        neighbors_mean = (s_prev + s_next + r_inner + r_outer) / 4.0
+        edge_sal = np.abs(luma - neighbors_mean)
+        max_edge = edge_sal.max()
+        if max_edge > 0:
+            edge_sal /= max_edge
         
-        if edge_sal.max() > 0:
-            edge_sal = edge_sal / edge_sal.max()
-        
-        # 4. BIAIS CENTRAL - la fovéa (anneaux centraux) est privilégiée
-        center_sal = np.zeros_like(self._luma)
-        for ring in range(num_rings):
-            # Décroissance gaussienne depuis le centre
-            ring_weight = math.exp(-0.5 * (ring / (num_rings / 4)) ** 2)
-            center_sal[ring, :] = ring_weight
+        # 4. BIAIS CENTRAL - décroissance gaussienne pré-calculée
+        if not hasattr(self, '_center_bias'):
+            rings = np.arange(num_rings)
+            sigma = num_rings / 4
+            self._center_bias = np.exp(-0.5 * (rings / sigma) ** 2)[:, np.newaxis]
+        center_sal = self._center_bias
         
         # COMBINAISON PONDÉRÉE
         saliency = (
@@ -522,11 +593,12 @@ class ColorFovea(Fovea):
         )
         
         # Masquer par alpha (ignorer les zones hors image)
-        saliency = saliency * self._alpha
+        saliency *= self._alpha
         
         # Normaliser [0, 1]
-        if saliency.max() > 0:
-            saliency = saliency / saliency.max()
+        max_sal = saliency.max()
+        if max_sal > 0:
+            saliency /= max_sal
         
         return saliency.astype(np.float32)
 
