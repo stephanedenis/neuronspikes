@@ -1907,10 +1907,10 @@ def main():
     parser = argparse.ArgumentParser(description='Agent stéréo avec attention')
     parser.add_argument('-c', '--camera', type=int, default=1,
                         help='Index de la caméra stéréo')
-    parser.add_argument('-r', '--rings', type=int, default=16,
-                        help='Nombre d\'anneaux (défaut: 16 pour meilleure résolution)')
-    parser.add_argument('-s', '--sectors', type=int, default=24,
-                        help='Nombre de secteurs (défaut: 24 pour meilleure résolution)')
+    parser.add_argument('-r', '--rings', type=int, default=48,
+                        help='Nombre d\'anneaux (défaut: 48 pour haute résolution)')
+    parser.add_argument('-s', '--sectors', type=int, default=32,
+                        help='Nombre de secteurs (défaut: 32 pour haute résolution)')
     parser.add_argument('--color', action='store_true',
                         help='Mode couleur avec détection de mouvement (ColorFovea)')
     args = parser.parse_args()
@@ -1922,14 +1922,27 @@ def main():
         print(f"Erreur: {e}")
         return 1
     
-    # Configuration des fovéas - grande zone pour meilleure convergence stéréo
-    # Plus de résolution = meilleure corrélation entre les deux yeux
+    # Configuration des fovéas - haute résolution bio-inspirée
+    # Utilise 80% de la hauteur pour une couverture optimale
+    # Plus de cellules = meilleure corrélation stéréo et presque pixel-perfect au centre
+    
+    # Calculer le rayon max pour couvrir 80% de la hauteur
+    target_coverage = 0.80
+    max_rad = int(camera.height * target_coverage / 2)  # 288px pour 720p
+    
+    # Zone fovéale centrale (haute résolution) ~20% du rayon total
+    fovea_rad = max(32, max_rad // 4)  # ~72px pour max_rad=288
+    
     config = FoveaConfig(
         num_rings=args.rings,
         num_sectors=args.sectors,
-        fovea_radius=32,      # Zone centrale haute résolution: 32px
-        max_radius=128,       # Rayon total: 128px (fovéa de 256px de diamètre)
+        fovea_radius=fovea_rad,   # Zone centrale haute résolution: ~72px
+        max_radius=max_rad,       # Rayon total: 80% de hauteur/2
     )
+    
+    print(f"Fovéa: {max_rad*2}px diamètre ({target_coverage*100:.0f}% de {camera.height}px)")
+    print(f"  {args.rings} anneaux × {args.sectors} secteurs = {args.rings * args.sectors} cellules")
+    print(f"  Résolution centrale: ~{fovea_rad / (args.rings // 4):.1f}px/anneau")
     
     # Créer l'agent d'attention
     agent = AttentionAgent(
