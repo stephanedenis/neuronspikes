@@ -482,3 +482,97 @@ examples/
 
 *Journal maintenu automatiquement - Chaque commit contient une entrée détaillée*
 
+
+## 2026-02-01 - Voies Rétiniennes Bio-Inspirées
+
+### Concept: Traitement Parallèle du Système Visuel Humain
+
+Implémentation des voies visuelles parallèles inspirées de la neuroanatomie:
+
+```
+                    RÉTINE (sampling)
+                         │
+            ┌────────────┼────────────┐
+            ↓            ↓            ↓
+         Magno         Parvo      Konio (bleu)
+       (mouvement)   (détails)
+            │            │            │
+            ↓            ↓            ↓
+         ┌──┴────────────┴────────────┴──┐
+         │         V1 (Gabor)            │
+         │   Orientation × Fréquence     │
+         └──────────────┬────────────────┘
+                        │
+            ┌───────────┴───────────┐
+            ↓                       ↓
+      Voie DORSALE            Voie VENTRALE
+      (MT → Pariétal)         (V4 → IT)
+      Mouvement/3D            Forme/Objet
+```
+
+### Module `retinal_pathways.py`
+
+| Classe | Description | Fonction biologique |
+|--------|-------------|---------------------|
+| `MagnocellularPathway` | Détection de mouvement | Voie dorsale (OÙ/COMMENT) |
+| `ParvocellularPathway` | Couleur et détails | Voie ventrale (QUOI) |
+| `LateralInhibition` | Centre-surround (DOG) | Cellules horizontales/amacrines |
+| `GaborFilterBank` | Détecteurs d'orientation | Cortex V1 (Hubel & Wiesel) |
+| `RetinalProcessor` | Pipeline complet | Saillance bottom-up |
+
+### Voie Magnocellulaire (M)
+
+- **Grands champs récepteurs** (σ=2.0)
+- **Réponse transitoire** (sensible au changement)
+- **Haute sensibilité au mouvement** (seuil 0.03)
+- **Accumulation temporelle** avec décroissance (τ=0.7)
+
+### Voie Parvocellulaire (P)
+
+- **Petits champs récepteurs** (haute résolution)
+- **Opposition de couleur**:
+  - Rouge-Vert (cellules P type I)
+  - Bleu-Jaune (cellules K)
+- **Détection de bords** (Laplacien)
+
+### Filtres de Gabor (V1)
+
+- **8 orientations** × **2 échelles** = 16 filtres
+- **Énergie d'orientation** par pixel
+- **Orientation dominante** par interpolation
+
+### Saillance Combinée
+
+Pondération bio-inspirée (le mouvement prime pour la survie):
+
+| Source | Poids | Justification |
+|--------|-------|---------------|
+| Mouvement (Magno) | 40% | Détection prédateurs/proies |
+| Bords | 15% | Contours d'objets |
+| Couleur R-G | 15% | Fruits mûrs, dangers |
+| Couleur B-Y | 10% | Ciel, eau |
+| Orientation (V1) | 20% | Textures, structures |
+
+### Visualisation dans l'Agent Stéréo
+
+Nouveau panneau "RETINAL" avec 4 sous-panneaux:
+
+```
+┌────┬────┐
+│ M  │ P  │  M = Motion (cyan)
+├────┼────┤  P = Color R-G (rouge/vert)
+│ V1 │ S  │  V1 = Orientation (HSV)
+└────┴────┘  S = Saillance (jaune)
+```
+
+### Tests Unitaires
+
+- **20 tests** dans `tests/test_retinal_pathways.py`
+- Couverture: Magno, Parvo, LateralInhibition, GaborFilterBank, RetinalProcessor
+
+### Branche Git
+
+- **Branche**: `feat/bio-inspired-visual-pathways`
+- **Commits**:
+  - `0523d1c` - Module retinal_pathways.py + tests
+  - `f96aab1` - Intégration dans live_stereo_agent.py
