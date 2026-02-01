@@ -509,20 +509,21 @@ class NeuronStack:
             ))
             
             # Corrélateur temporel pour cette couche
+            # Paramètres ajustés pour une meilleure détection de patterns visuels
             self._correlators.append(TemporalCorrelator(
                 shape=current_shape,
                 config=CorrelationConfig(
                     history_size=30,
-                    min_overlap=0.6,
-                    min_occurrences=5,
-                    confidence_threshold=0.6,
+                    min_overlap=0.4,           # Plus permissif (était 0.6)
+                    min_occurrences=3,         # Plus rapide (était 5)
+                    confidence_threshold=0.5,  # Plus sensible (était 0.6)
                 )
             ))
             
             # Détecteur de groupes pour cette couche
             self._group_detectors.append(GroupDetector(
                 config=GroupDetectorConfig(
-                    min_group_size=3,
+                    min_group_size=2,          # Groupes plus petits (était 3)
                     connectivity=8,
                     track_history=30,
                 )
@@ -591,8 +592,14 @@ class NeuronStack:
                     current_input, layer.shape
                 )
             
-            # 1. Détecter les groupes d'activation dans l'entrée (convertir en booléen)
-            activation_mask = current_input > 0.5  # Seuil d'activation
+            # 1. Détecter les groupes d'activation dans l'entrée
+            # Seuil adaptatif: moyenne + 0.5 * écart-type
+            # Cela capture les pixels "plus actifs que la normale"
+            mean_val = current_input.mean()
+            std_val = current_input.std()
+            threshold = max(0.1, mean_val + 0.5 * std_val)
+            activation_mask = current_input > threshold
+            
             groups = self._group_detectors[layer_idx].detect_groups(
                 activation_mask, 
                 slot=0, 

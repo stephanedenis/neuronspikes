@@ -284,15 +284,15 @@ class AttentionAgent:
         # Entrée: activations de la fovéa (rings × sectors)
         fovea_shape = (fovea_config.num_rings, fovea_config.num_sectors)
         genesis_config = GenesisConfig(
-            min_pattern_confidence=0.7,
-            min_pattern_occurrences=10,
+            min_pattern_confidence=0.5,      # Plus permissif (était 0.7)
+            min_pattern_occurrences=5,       # Plus rapide (était 10)
             max_neurons_per_layer=200,
-            neuron_merge_threshold=0.6,
+            neuron_merge_threshold=0.5,      # Moins de fusion (était 0.6)
         )
         neuron_config = NeuronConfig(
-            threshold=0.6,
-            decay_rate=0.05,
-            refractory_period=3,
+            threshold=0.4,                   # Plus sensible (était 0.6)
+            decay_rate=0.1,                  # Décroissance plus rapide (était 0.05)
+            refractory_period=2,             # Plus court (était 3)
         )
         self.neuron_stack = NeuronStack(
             base_shape=fovea_shape,
