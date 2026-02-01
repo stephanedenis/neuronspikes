@@ -1592,15 +1592,87 @@ class OculomotorState:
         return tuple(deltas)
 
 
+def polar_data_to_circular_image(
+    data: np.ndarray,
+    size: int,
+    cmap: str = 'gray',
+    vmin: float = None,
+    vmax: float = None
+) -> np.ndarray:
+    """Convertit des données polaires (rings × sectors) en image circulaire.
+    
+    Args:
+        data: Tableau 2D (num_rings × num_sectors) en coordonnées polaires
+        size: Taille de l'image de sortie (carré)
+        cmap: Colormap ('gray', 'jet', 'hot', 'cool', 'hsv')
+        vmin, vmax: Limites de normalisation
+        
+    Returns:
+        Image BGR circulaire
+    """
+    num_rings, num_sectors = data.shape
+    
+    # Normaliser les données
+    if vmin is None:
+        vmin = data.min()
+    if vmax is None:
+        vmax = data.max()
+    if vmax <= vmin:
+        vmax = vmin + 1
+    normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+    
+    # Créer l'image de sortie
+    img = np.zeros((size, size), dtype=np.float32)
+    center = size // 2
+    max_radius = center - 2
+    
+    # Pour chaque pixel, trouver la cellule polaire correspondante
+    for y in range(size):
+        for x in range(size):
+            dx = x - center
+            dy = y - center
+            r = math.sqrt(dx*dx + dy*dy)
+            
+            if r < max_radius and r > 0:
+                # Calculer l'anneau (ring)
+                ring_idx = int(r / max_radius * num_rings)
+                ring_idx = min(ring_idx, num_rings - 1)
+                
+                # Calculer le secteur (angle)
+                angle = math.atan2(dy, dx)
+                if angle < 0:
+                    angle += 2 * math.pi
+                sector_idx = int(angle / (2 * math.pi) * num_sectors) % num_sectors
+                
+                img[y, x] = normalized[ring_idx, sector_idx]
+    
+    # Convertir en uint8
+    img_uint8 = (img * 255).astype(np.uint8)
+    
+    # Appliquer la colormap
+    if cmap == 'gray':
+        return cv2.cvtColor(img_uint8, cv2.COLOR_GRAY2BGR)
+    elif cmap == 'jet':
+        return cv2.applyColorMap(img_uint8, cv2.COLORMAP_JET)
+    elif cmap == 'hot':
+        return cv2.applyColorMap(img_uint8, cv2.COLORMAP_HOT)
+    elif cmap == 'cool':
+        return cv2.applyColorMap(img_uint8, cv2.COLORMAP_COOL)
+    elif cmap == 'hsv':
+        return cv2.applyColorMap(img_uint8, cv2.COLORMAP_HSV)
+    else:
+        return cv2.cvtColor(img_uint8, cv2.COLOR_GRAY2BGR)
+
+
 def draw_polar_channels(
     fovea: ColorFovea,
     result: dict,
     size: int = 180,
     label: str = "L"
 ) -> np.ndarray:
-    """Visualise les canaux polaires d'une ColorFovea.
+    """Visualise les canaux polaires d'une ColorFovea en représentation CIRCULAIRE.
     
-    Affiche une grille 2×3 avec:
+    Affiche une grille 2×3 avec des vues circulaires:
     - Luma (luminance Y)
     - Chroma U (bleu-jaune)  
     - Chroma V (rouge-cyan)
@@ -1631,55 +1703,45 @@ def draw_polar_channels(
         saliency = np.zeros_like(luma)
     
     # Dimensions de la grille: 2 lignes × 3 colonnes
-    cell_w = size // 3
+    cell_size = size // 3  # Taille de chaque cellule circulaire
     cell_h = size // 2
     viz = np.zeros((size, size, 3), dtype=np.uint8)
     
-    def polar_to_img(data, cmap='gray', vmin=None, vmax=None):
-        """Convertit données polaires en image colorée."""
-        if vmin is None:
-            vmin = data.min()
-        if vmax is None:
-            vmax = data.max()
-        if vmax <= vmin:
-            vmax = vmin + 1
-        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
-        img = (normalized * 255).astype(np.uint8)
-        img = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
-        if cmap == 'gray':
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif cmap == 'jet':
-            return cv2.applyColorMap(img, cv2.COLORMAP_JET)
-        elif cmap == 'hot':
-            return cv2.applyColorMap(img, cv2.COLORMAP_HOT)
-        elif cmap == 'cool':
-            return cv2.applyColorMap(img, cv2.COLORMAP_COOL)
-        else:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # Créer les 6 visualisations circulaires
+    channels = [
+        (luma, 'gray', 0, 255, 'Y'),
+        (chroma_u, 'cool', 0, 255, 'U'),
+        (chroma_v, 'hot', 0, 255, 'V'),
+        (motion, 'jet', 0, max(motion.max(), 1), 'M'),
+        (saliency, 'hot', 0, 1, 'S'),
+        (alpha, 'gray', 0, 1, 'α'),
+    ]
     
-    # Ligne 1: Luma, Chroma U, Chroma V
-    viz[0:cell_h, 0:cell_w] = polar_to_img(luma, 'gray', 0, 255)
-    viz[0:cell_h, cell_w:2*cell_w] = polar_to_img(chroma_u, 'cool', 0, 255)
-    viz[0:cell_h, 2*cell_w:3*cell_w] = polar_to_img(chroma_v, 'hot', 0, 255)
+    positions = [
+        (0, 0), (cell_size, 0), (2*cell_size, 0),
+        (0, cell_h), (cell_size, cell_h), (2*cell_size, cell_h)
+    ]
     
-    # Ligne 2: Motion, Saillance, Alpha
-    viz[cell_h:2*cell_h, 0:cell_w] = polar_to_img(motion, 'jet', 0, motion.max() + 1)
-    viz[cell_h:2*cell_h, cell_w:2*cell_w] = polar_to_img(saliency, 'hot', 0, 1)
-    viz[cell_h:2*cell_h, 2*cell_w:3*cell_w] = polar_to_img(alpha, 'gray', 0, 1)
-    
-    # Labels
     font = cv2.FONT_HERSHEY_SIMPLEX
-    labels = [('Y', 0, 0), ('U', cell_w, 0), ('V', 2*cell_w, 0),
-              ('M', 0, cell_h), ('S', cell_w, cell_h), ('α', 2*cell_w, cell_h)]
-    for txt, x, y in labels:
-        cv2.putText(viz, txt, (x + 2, y + 12), font, 0.35, (200, 200, 200), 1)
+    
+    for i, (data, cmap, vmin, vmax, lbl) in enumerate(channels):
+        x, y = positions[i]
+        # Générer l'image circulaire
+        circular = polar_data_to_circular_image(data, cell_size, cmap, vmin, vmax)
+        # Redimensionner si nécessaire
+        if circular.shape[0] != cell_h or circular.shape[1] != cell_size:
+            circular = cv2.resize(circular, (cell_size, cell_h))
+        # Placer dans la grille
+        viz[y:y+cell_h, x:x+cell_size] = circular[:cell_h, :cell_size]
+        # Label
+        cv2.putText(viz, lbl, (x + 2, y + 12), font, 0.35, (200, 200, 200), 1)
     
     # Label œil
     cv2.putText(viz, label, (size - 15, 15), font, 0.5, (255, 255, 0), 1)
     
     # Bordures
-    cv2.line(viz, (cell_w, 0), (cell_w, size), (50, 50, 50), 1)
-    cv2.line(viz, (2*cell_w, 0), (2*cell_w, size), (50, 50, 50), 1)
+    cv2.line(viz, (cell_size, 0), (cell_size, size), (50, 50, 50), 1)
+    cv2.line(viz, (2*cell_size, 0), (2*cell_size, size), (50, 50, 50), 1)
     cv2.line(viz, (0, cell_h), (size, cell_h), (50, 50, 50), 1)
     
     return viz
@@ -1691,38 +1753,26 @@ def draw_correlation_map(
     size: int = 180,
     show_disparity: bool = False
 ) -> np.ndarray:
-    """Visualise la corrélation ou disparité binoculaire.
+    """Visualise la corrélation ou disparité binoculaire en représentation CIRCULAIRE.
     
     Args:
-        left_act: Activations œil gauche
-        right_act: Activations œil droit
+        left_act: Activations œil gauche (polaires)
+        right_act: Activations œil droit (polaires)
         size: Taille de l'image
         show_disparity: True pour disparité, False pour corrélation
         
     Returns:
-        Image BGR
+        Image BGR circulaire
     """
     if show_disparity:
         # Disparité = différence
         data = left_act - right_act
-        data_norm = (data - data.min()) / (data.max() - data.min() + 1e-6)
-        viz = cv2.applyColorMap((data_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        viz = cv2.resize(viz, (size, size), interpolation=cv2.INTER_NEAREST)
+        viz = polar_data_to_circular_image(data, size, 'jet')
         cv2.putText(viz, "Disp", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
     else:
         # Corrélation = produit
         corr = left_act * right_act
-        corr_norm = corr / (corr.max() + 1e-6)
-        viz = np.zeros((size, size, 3), dtype=np.uint8)
-        h, w = corr_norm.shape
-        cell_h, cell_w = size // h, size // w
-        for i in range(h):
-            for j in range(w):
-                c = corr_norm[i, j]
-                color = (int(c * 100), int(c * 255), int(c * 200))
-                y1, y2 = i * cell_h, (i + 1) * cell_h
-                x1, x2 = j * cell_w, (j + 1) * cell_w
-                viz[y1:y2, x1:x2] = color
+        viz = polar_data_to_circular_image(corr, size, 'hot')
         cv2.putText(viz, "Corr", (3, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
     
     return viz
