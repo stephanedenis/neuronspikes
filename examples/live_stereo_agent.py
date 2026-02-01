@@ -275,6 +275,11 @@ class AttentionAgent:
         # État proprioceptif des muscles oculaires
         self.oculomotor = OculomotorState()
         
+        # Mémoire saccadique - associe patterns visuels et mouvements
+        self.saccade_memory = SaccadeMemory(max_items=200)
+        self._in_saccade = False  # Suivi de l'état de saccade
+        self._pre_saccade_pattern: Optional[np.ndarray] = None
+        
         # État
         self.autonomous = True
         self.frame_count = 0
@@ -542,20 +547,24 @@ class AttentionAgent:
     ) -> float:
         """Ajuste dynamiquement la vergence pour maximiser la corrélation.
         
-        Cherche l'offset horizontal optimal entre les deux yeux pour
-        aligner parfaitement les images sur le point d'attention.
+        Utilise une recherche par corrélation croisée normalisée (NCC)
+        pour trouver l'offset horizontal optimal.
+        
+        IMPORTANT: Cette vergence est utilisée uniquement quand on n'a pas
+        de détection explicite de la cible dans les deux yeux. Sinon,
+        on utilise la différence de position détectée directement.
         
         Args:
             left_img: Image gauche complète
             right_img: Image droite complète
-            attention_x: Position X du regard dans l'image de référence
+            attention_x: Position X du regard dans l'image gauche
             attention_y: Position Y du regard
             
         Returns:
             Nouvel offset de vergence
         """
-        # Taille de la fenêtre de recherche - plus grande pour meilleure corrélation
-        window_size = 64
+        # Taille de la fenêtre - plus petite pour plus de précision locale
+        window_size = 48
         half_w = window_size // 2
         
         # Position entière pour extraction
@@ -565,7 +574,7 @@ class AttentionAgent:
         # Vérifier les limites
         h, w = left_img.shape[:2]
         if cx - half_w < 0 or cx + half_w >= w or cy - half_w < 0 or cy + half_w >= h:
-            return self.vergence_offset  # Garder la vergence actuelle
+            return self.vergence_offset
         
         # Extraire la fenêtre de référence (œil gauche)
         ref_window = left_img[cy - half_w:cy + half_w, cx - half_w:cx + half_w]
@@ -575,24 +584,33 @@ class AttentionAgent:
             ref_gray = ref_window.astype(float)
         
         # Normaliser la référence
-        ref_norm = ref_gray - np.mean(ref_gray)
+        ref_mean = np.mean(ref_gray)
         ref_std = np.std(ref_gray) + 1e-6
-        ref_norm = ref_norm / ref_std
+        ref_norm = (ref_gray - ref_mean) / ref_std
         
-        # Chercher le meilleur offset (-30 à +30 pixels)
+        # Recherche sub-pixel autour de la vergence actuelle
+        # Plage de recherche adaptative: plus étroite si on est stable
+        vergence_stable = len(self.vergence_history) > 10 and \
+                         np.std(self.vergence_history[-10:]) < 3.0
+        
+        if vergence_stable:
+            # Recherche fine autour de la position actuelle
+            search_range = 10
+            search_step = 1
+        else:
+            # Recherche large
+            search_range = int(self.vergence_max - self.vergence_min)
+            search_step = 2
+        
         best_offset = self.vergence_offset
         best_corr = -1.0
         
-        # Recherche grossière puis fine
-        search_offsets = list(range(int(self.vergence_min), int(self.vergence_max) + 1, 3))
-        # Ajouter la vergence actuelle et ses voisins
-        for delta in range(-3, 4):
-            candidate = int(self.vergence_offset + delta)
-            if candidate not in search_offsets:
-                search_offsets.append(candidate)
+        # Chercher le meilleur offset
+        start = max(int(self.vergence_min), int(self.vergence_offset - search_range))
+        end = min(int(self.vergence_max), int(self.vergence_offset + search_range))
         
-        for offset in search_offsets:
-            test_x = cx + offset
+        for offset in range(start, end + 1, search_step):
+            test_x = cx - offset  # Œil droit regarde à gauche pour converger
             if test_x - half_w < 0 or test_x + half_w >= w:
                 continue
             
@@ -604,33 +622,60 @@ class AttentionAgent:
                 test_gray = test_window.astype(float)
             
             # Normaliser
-            test_norm = test_gray - np.mean(test_gray)
+            test_mean = np.mean(test_gray)
             test_std = np.std(test_gray) + 1e-6
-            test_norm = test_norm / test_std
+            test_norm = (test_gray - test_mean) / test_std
             
             # Corrélation croisée normalisée
-            corr = np.sum(ref_norm * test_norm) / (window_size * window_size)
+            corr = np.mean(ref_norm * test_norm)
             
             if corr > best_corr:
                 best_corr = corr
                 best_offset = float(offset)
         
-        # Lissage avec vélocité (éviter les sauts brusques)
-        target_velocity = (best_offset - self.vergence_offset) * self.vergence_speed
-        self.vergence_velocity = 0.7 * self.vergence_velocity + 0.3 * target_velocity
+        # Raffinement sub-pixel par interpolation parabolique
+        if best_corr > 0.3 and search_step == 1:
+            # Calculer les corrélations voisines
+            offsets_to_check = [best_offset - 1, best_offset, best_offset + 1]
+            corrs = []
+            for off in offsets_to_check:
+                test_x = cx - int(off)
+                if test_x - half_w >= 0 and test_x + half_w < w:
+                    tw = right_img[cy - half_w:cy + half_w, test_x - half_w:test_x + half_w]
+                    if len(tw.shape) == 3:
+                        tg = np.mean(tw, axis=2)
+                    else:
+                        tg = tw.astype(float)
+                    tn = (tg - np.mean(tg)) / (np.std(tg) + 1e-6)
+                    corrs.append(np.mean(ref_norm * tn))
+                else:
+                    corrs.append(0)
+            
+            if len(corrs) == 3 and corrs[0] != corrs[2]:
+                # Interpolation parabolique
+                denom = 2 * (corrs[0] - 2 * corrs[1] + corrs[2])
+                if abs(denom) > 1e-6:
+                    sub_offset = (corrs[0] - corrs[2]) / denom
+                    best_offset += np.clip(sub_offset, -0.5, 0.5)
         
-        # Appliquer la vélocité
+        # Lissage temporel (plus fort si corrélation bonne)
+        alpha = 0.3 if best_corr > 0.5 else 0.1
+        target_velocity = (best_offset - self.vergence_offset) * alpha
+        self.vergence_velocity = 0.8 * self.vergence_velocity + 0.2 * target_velocity
+        
+        # Appliquer la vélocité avec damping
         new_offset = self.vergence_offset + self.vergence_velocity
         
         # Clamp aux limites
         new_offset = max(self.vergence_min, min(self.vergence_max, new_offset))
         
-        # Historique pour analyse
+        # Historique
         self.vergence_history.append(new_offset)
         if len(self.vergence_history) > 60:
             self.vergence_history.pop(0)
         
         self.vergence_offset = new_offset
+        self._last_vergence_corr = best_corr  # Pour debug
         return new_offset
     
     def decide_next_action(
@@ -647,6 +692,8 @@ class AttentionAgent:
         2. Saccade vers le MEILLEUR point d'intérêt (pas aléatoire)
         3. Long temps de fixation pour laisser la vergence s'optimiser
         4. Construit une représentation d'ensemble par exploration méthodique
+        5. LIMITE les saccades à la périphérie visible pour maintenir
+           la continuité perceptive (chevauchement des patterns)
         
         Returns:
             Nouvelle cible (x, y) ou None si pas de mouvement
@@ -659,6 +706,11 @@ class AttentionAgent:
         frames_since_saccade = self.frame_count - self.last_saccade_frame
         if frames_since_saccade < self.min_saccade_interval:
             return None
+        
+        # Distance max de saccade = rayon périphérique de la fovéa
+        # Ceci assure un chevauchement entre avant/après pour la mémoire saccadique
+        max_saccade_dist = self.config.max_radius * 1.5  # ~périphérie visible
+        min_saccade_dist = self.config.fovea_radius * 0.5  # Éviter micro-saccades
         
         # Mettre à jour le système d'attention
         self.attention.update(
@@ -686,44 +738,53 @@ class AttentionAgent:
         # 1. Bonne corrélation (vergence OK)
         # 2. Fixation assez longue (a bien exploré cette zone)
         # 3. Il existe un meilleur point d'intérêt ailleurs
+        # 4. La cible est dans la zone périphérique (pas trop loin!)
         
         min_fixation_for_saccade = 30  # ~1 seconde à 30fps
         if not self.gaze.is_fixating or self.gaze.fixation_time < min_fixation_for_saccade:
             return None
         
-        # Chercher le meilleur point d'intérêt (pas inhibé)
+        # Chercher le meilleur point d'intérêt DANS LA PÉRIPHÉRIE
         if saliency_map is not None:
             # Utiliser l'attention controller pour sélectionner la cible
             # avec inhibition de retour (évite les zones déjà visitées)
             target = self.attention.select_next_target(saliency_map, correlation)
             
-            # Vérifier que c'est assez différent de la position actuelle
+            # Vérifier que la cible est dans la zone périphérique
             dist = math.sqrt(
                 (target[0] - self.gaze.x)**2 + 
                 (target[1] - self.gaze.y)**2
             )
-            # Seuil de distance plus élevé pour éviter les micro-saccades
-            if dist > 60:
+            # Saccade seulement si dans la zone périphérique [min, max]
+            if min_saccade_dist < dist < max_saccade_dist:
                 return target
-        elif saliency_peaks:
-            # Fallback: utiliser le meilleur pic non-inhibé
+        
+        # Fallback ou saliency_peaks: chercher dans la périphérie
+        if saliency_peaks:
+            # Utiliser le meilleur pic non-inhibé DANS LA PÉRIPHÉRIE
             best_peak = None
             best_score = -1
             
             for peak in saliency_peaks:
-                inhibition = self.attention.inhibition.get_inhibition_at(peak.x, peak.y)
-                # Score = saillance × (1 - inhibition)
-                score = peak.strength * (1 - inhibition)
-                
                 dist = math.sqrt(
                     (peak.x - self.gaze.x)**2 + 
                     (peak.y - self.gaze.y)**2
                 )
-                # Bonus pour les points distants (exploration)
-                if dist > 60:
-                    score *= 1.2
                 
-                if score > best_score and dist > 60:
+                # IGNORER les cibles hors de la zone périphérique
+                if dist < min_saccade_dist or dist > max_saccade_dist:
+                    continue
+                
+                inhibition = self.attention.inhibition.get_inhibition_at(peak.x, peak.y)
+                # Score = saillance × (1 - inhibition)
+                score = peak.strength * (1 - inhibition)
+                
+                # Préférer les cibles à distance optimale (milieu de la périphérie)
+                optimal_dist = (min_saccade_dist + max_saccade_dist) / 2
+                dist_score = 1.0 - abs(dist - optimal_dist) / max_saccade_dist
+                score *= (0.8 + 0.4 * dist_score)
+                
+                if score > best_score:
                     best_score = score
                     best_peak = peak
             
@@ -795,13 +856,35 @@ class AttentionAgent:
         # Mettre à jour la position du regard
         gaze_x, gaze_y = self.gaze.update()
         
+        # Variable pour savoir si on a une cible binoculaire directe
+        self._direct_vergence = False
+        
         # Si on a détecté une lumière brillante, FORCER le regard dessus
         if saliency_peaks and saliency_peaks[0].strength > 1.0:
             # C'est une lumière (strength > 1.0 = brightness * 1.5 > 1.0)
             bright_peak = saliency_peaks[0]
             gaze_x = bright_peak.x
             gaze_y = bright_peak.y
-            gaze_x_right = bright_peak.x_right if bright_peak.x_right is not None else gaze_x - self.vergence_offset
+            
+            if bright_peak.x_right is not None:
+                # On a détecté la lumière dans les DEUX yeux!
+                # Utiliser directement la disparité mesurée pour la vergence
+                direct_disparity = gaze_x - bright_peak.x_right
+                
+                # Mise à jour DIRECTE de la vergence (pas par corrélation)
+                # Lissage doux pour éviter les sauts
+                alpha = 0.4  # Plus réactif car mesure directe fiable
+                self.vergence_velocity = 0.7 * self.vergence_velocity + 0.3 * (direct_disparity - self.vergence_offset)
+                self.vergence_offset = 0.6 * self.vergence_offset + 0.4 * direct_disparity
+                self.vergence_offset = max(self.vergence_min, min(self.vergence_max, self.vergence_offset))
+                
+                # L'œil droit regarde directement la position détectée
+                gaze_x_right = bright_peak.x_right
+                self._direct_vergence = True
+            else:
+                # Lumière détectée seulement dans l'œil gauche
+                gaze_x_right = gaze_x - self.vergence_offset
+            
             # Mettre à jour le contrôleur de gaze pour qu'il suive
             self.gaze.x = gaze_x
             self.gaze.y = gaze_y
@@ -809,11 +892,14 @@ class AttentionAgent:
             # Pas de lumière brillante, utiliser vergence normale
             gaze_x_right = gaze_x - self.vergence_offset
         
-        # Mettre à jour la vergence dynamique pour optimiser l'alignement
-        if left_color is not None and right_color is not None:
-            self.update_vergence(left_color, right_color, gaze_x, gaze_y)
-        else:
-            self.update_vergence(left_gray, right_gray, gaze_x, gaze_y)
+        # Mettre à jour la vergence par corrélation SEULEMENT si pas de vergence directe
+        if not self._direct_vergence:
+            if left_color is not None and right_color is not None:
+                self.update_vergence(left_color, right_color, gaze_x, gaze_y)
+            else:
+                self.update_vergence(left_gray, right_gray, gaze_x, gaze_y)
+            # Recalculer gaze_x_right avec la vergence mise à jour
+            gaze_x_right = gaze_x - self.vergence_offset
         
         # Positionner les fovéas - chaque œil regarde sa propre cible
         self.left_fovea.set_gaze(gaze_x, gaze_y)
@@ -873,6 +959,18 @@ class AttentionAgent:
         # Combiner les cartes de saillance pour le système d'attention
         combined_saliency = (saliency_left + saliency_right) / 2
         
+        # Combiner patterns gauche/droite pour la mémoire
+        combined_pattern = (left_act + right_act) / 2.0
+        
+        # Vérifier si on vient de finir une saccade
+        was_in_saccade = self._in_saccade
+        self._in_saccade = self.gaze.in_saccade
+        
+        if was_in_saccade and not self._in_saccade:
+            # Fin de saccade - enregistrer l'association
+            motor_vec = self.oculomotor.get_motor_vector()
+            self.saccade_memory.end_saccade(combined_pattern, motor_vec)
+        
         # Décider de la prochaine action (avec inhibition de retour et zoom)
         next_target = self.decide_next_action(
             correlation, 
@@ -881,6 +979,11 @@ class AttentionAgent:
             features=left_act
         )
         if next_target is not None:
+            # Début de saccade - enregistrer le pattern actuel
+            motor_vec = self.oculomotor.get_motor_vector()
+            self.saccade_memory.start_saccade(combined_pattern, motor_vec)
+            self._in_saccade = True
+            
             # Contraindre la cible aux limites (ajustées au zoom)
             x, y = self.attention.zoom.constrain_gaze(*next_target)
             self.gaze.saccade_to(x, y)
@@ -934,9 +1037,14 @@ class AttentionAgent:
             # Vergence dynamique
             'vergence_offset': self.vergence_offset,
             'vergence_velocity': self.vergence_velocity,
+            'direct_vergence': self._direct_vergence,  # True = vergence par détection directe
+            'vergence_correlation': getattr(self, '_last_vergence_corr', 0.0),
             # Proprioception oculomoteur
             'oculomotor_spikes': oculomotor_spikes,
             'oculomotor_state': self.oculomotor,
+            # Mémoire saccadique
+            'saccade_memory_stats': self.saccade_memory.get_stats(),
+            'motor_effort': self.oculomotor.effort,
             # NeuronStack - genèse dynamique
             'stack_neurons': stack_stats['total_neurons'],
             'stack_patterns': sum(stack_stats.get('patterns_per_layer', [])),
@@ -1011,6 +1119,239 @@ class StereoCamera:
 
 
 @dataclass
+class SaccadeMemoryItem:
+    """Un élément de mémoire saccadique.
+    
+    Lie un pattern visuel pré-saccade avec un pattern post-saccade
+    via le vecteur de commande musculaire qui les relie.
+    """
+    # Patterns visuels (activations fovéales)
+    pre_pattern: np.ndarray      # Pattern avant la saccade
+    post_pattern: np.ndarray     # Pattern après la saccade
+    
+    # Commande musculaire qui lie les deux
+    motor_command: np.ndarray    # [dx, dy, d_vergence, rotation]
+    
+    # Métadonnées
+    timestamp: float = 0.0
+    confidence: float = 1.0      # Décroît si non confirmé
+    uses: int = 0                # Nombre d'utilisations pour prédiction
+    
+    def similarity(self, pattern: np.ndarray) -> float:
+        """Calcule la similarité avec un pattern donné."""
+        if pattern.shape != self.pre_pattern.shape:
+            return 0.0
+        # Corrélation normalisée
+        norm_pre = np.linalg.norm(self.pre_pattern)
+        norm_pat = np.linalg.norm(pattern)
+        if norm_pre < 1e-6 or norm_pat < 1e-6:
+            return 0.0
+        return np.dot(self.pre_pattern.flatten(), pattern.flatten()) / (norm_pre * norm_pat)
+
+
+class SaccadeMemory:
+    """Mémoire associative des saccades.
+    
+    Permet de:
+    1. Prédire ce qu'on va voir après une saccade (forward model)
+    2. Estimer le mouvement nécessaire pour atteindre un pattern cible
+    3. Construire une représentation spatiale cohérente de l'environnement
+    
+    Bio-inspiration: Colliculus supérieur + cortex pariétal postérieur
+    """
+    
+    def __init__(self, max_items: int = 100, similarity_threshold: float = 0.8):
+        self.memories: List[SaccadeMemoryItem] = []
+        self.max_items = max_items
+        self.similarity_threshold = similarity_threshold
+        
+        # Buffer pour enregistrer les saccades en cours
+        self._pre_saccade_pattern: Optional[np.ndarray] = None
+        self._pre_saccade_motor: Optional[np.ndarray] = None
+        self._saccade_start_time: float = 0.0
+        
+        # Statistiques
+        self.predictions_made = 0
+        self.predictions_correct = 0
+    
+    def start_saccade(
+        self, 
+        current_pattern: np.ndarray,
+        motor_command: np.ndarray
+    ):
+        """Appelé au début d'une saccade.
+        
+        Args:
+            current_pattern: Pattern visuel actuel (pré-saccade)
+            motor_command: Commande musculaire [dx, dy, d_verg, rotation]
+        """
+        self._pre_saccade_pattern = current_pattern.copy()
+        self._pre_saccade_motor = motor_command.copy()
+        self._saccade_start_time = time.time()
+    
+    def end_saccade(
+        self,
+        post_pattern: np.ndarray,
+        motor_actual: np.ndarray = None
+    ) -> Optional[SaccadeMemoryItem]:
+        """Appelé à la fin d'une saccade pour enregistrer l'association.
+        
+        Args:
+            post_pattern: Pattern visuel après la saccade
+            motor_actual: Commande motrice réelle (si différente de planifiée)
+            
+        Returns:
+            L'item de mémoire créé, ou None si pas de saccade en cours
+        """
+        if self._pre_saccade_pattern is None:
+            return None
+        
+        # Utiliser la commande réelle si fournie
+        motor = motor_actual if motor_actual is not None else self._pre_saccade_motor
+        
+        # Créer l'item de mémoire
+        item = SaccadeMemoryItem(
+            pre_pattern=self._pre_saccade_pattern,
+            post_pattern=post_pattern.copy(),
+            motor_command=motor.copy() if motor is not None else np.zeros(4),
+            timestamp=time.time()
+        )
+        
+        # Vérifier si un item similaire existe déjà
+        best_match = self._find_similar(item.pre_pattern, motor)
+        if best_match is not None and best_match.similarity(item.pre_pattern) > self.similarity_threshold:
+            # Fusionner avec l'existant (moyennage)
+            alpha = 0.3  # Poids du nouvel item
+            best_match.post_pattern = (1 - alpha) * best_match.post_pattern + alpha * item.post_pattern
+            best_match.confidence = min(1.0, best_match.confidence + 0.1)
+            best_match.uses += 1
+            item = best_match
+        else:
+            # Ajouter le nouvel item
+            self.memories.append(item)
+            if len(self.memories) > self.max_items:
+                # Supprimer le moins utilisé/confiant
+                self.memories.sort(key=lambda m: m.confidence * (1 + m.uses * 0.1))
+                self.memories.pop(0)
+        
+        # Reset du buffer
+        self._pre_saccade_pattern = None
+        self._pre_saccade_motor = None
+        
+        return item
+    
+    def predict_post_saccade(
+        self,
+        current_pattern: np.ndarray,
+        motor_command: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Prédit le pattern visuel après une saccade.
+        
+        Forward model: étant donné où je suis et où je vais,
+        qu'est-ce que je vais voir?
+        
+        Args:
+            current_pattern: Pattern visuel actuel
+            motor_command: Commande musculaire planifiée
+            
+        Returns:
+            Pattern prédit, ou None si pas de prédiction possible
+        """
+        best_match = self._find_similar(current_pattern, motor_command)
+        if best_match is None:
+            return None
+        
+        self.predictions_made += 1
+        return best_match.post_pattern.copy()
+    
+    def estimate_motor_command(
+        self,
+        current_pattern: np.ndarray,
+        target_pattern: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Estime la commande musculaire pour atteindre un pattern cible.
+        
+        Inverse model: étant donné où je suis et où je veux aller,
+        quel mouvement dois-je faire?
+        
+        Args:
+            current_pattern: Pattern visuel actuel
+            target_pattern: Pattern visuel cible
+            
+        Returns:
+            Commande motrice estimée, ou None si pas d'estimation possible
+        """
+        best_item = None
+        best_score = 0.0
+        
+        for item in self.memories:
+            # Score = similarité pré × similarité post
+            sim_pre = item.similarity(current_pattern)
+            sim_post = self._pattern_similarity(item.post_pattern, target_pattern)
+            score = sim_pre * sim_post
+            
+            if score > best_score:
+                best_score = score
+                best_item = item
+        
+        if best_item is not None and best_score > 0.3:
+            return best_item.motor_command.copy()
+        return None
+    
+    def validate_prediction(self, actual_pattern: np.ndarray, predicted_pattern: np.ndarray):
+        """Valide une prédiction pour améliorer les stats."""
+        sim = self._pattern_similarity(actual_pattern, predicted_pattern)
+        if sim > 0.7:
+            self.predictions_correct += 1
+    
+    def _find_similar(
+        self, 
+        pattern: np.ndarray, 
+        motor: np.ndarray
+    ) -> Optional[SaccadeMemoryItem]:
+        """Trouve l'item le plus similaire dans la mémoire."""
+        best_item = None
+        best_score = 0.0
+        
+        for item in self.memories:
+            # Similarité pattern + similarité motrice
+            sim_pattern = item.similarity(pattern)
+            if motor is not None and item.motor_command is not None:
+                motor_diff = np.linalg.norm(item.motor_command - motor)
+                sim_motor = np.exp(-motor_diff * 2)
+            else:
+                sim_motor = 0.5
+            
+            score = sim_pattern * 0.7 + sim_motor * 0.3
+            if score > best_score:
+                best_score = score
+                best_item = item
+        
+        return best_item if best_score > 0.3 else None
+    
+    def _pattern_similarity(self, p1: np.ndarray, p2: np.ndarray) -> float:
+        """Calcule la similarité entre deux patterns."""
+        if p1.shape != p2.shape:
+            return 0.0
+        norm1 = np.linalg.norm(p1)
+        norm2 = np.linalg.norm(p2)
+        if norm1 < 1e-6 or norm2 < 1e-6:
+            return 0.0
+        return np.dot(p1.flatten(), p2.flatten()) / (norm1 * norm2)
+    
+    def get_stats(self) -> dict:
+        """Retourne les statistiques de la mémoire."""
+        accuracy = self.predictions_correct / max(1, self.predictions_made)
+        return {
+            'num_memories': len(self.memories),
+            'predictions_made': self.predictions_made,
+            'predictions_correct': self.predictions_correct,
+            'accuracy': accuracy,
+            'avg_confidence': np.mean([m.confidence for m in self.memories]) if self.memories else 0.0,
+        }
+
+
+@dataclass
 class OculomotorState:
     """État proprioceptif des muscles oculaires virtuels.
     
@@ -1021,12 +1362,14 @@ class OculomotorState:
     6 muscles par œil (comme chez l'humain):
     - Droit médial/latéral: mouvement horizontal
     - Droit supérieur/inférieur: mouvement vertical
-    - Oblique supérieur/inférieur: torsion (non simulé ici)
+    - Oblique supérieur/inférieur: torsion/rotation
     
     Nous encodons:
     - Position X, Y en coordonnées normalisées [-1, 1]
     - Vélocité (dérivée de position)
     - Vergence (différence entre les deux yeux)
+    - Rotation/Torsion (cyclorotation)
+    - Effort musculaire (magnitude du mouvement)
     """
     # Positions normalisées [-1, 1]
     left_x: float = 0.0
@@ -1034,18 +1377,27 @@ class OculomotorState:
     right_x: float = 0.0
     right_y: float = 0.0
     
+    # Rotation/torsion (cyclotorsion) - normalisée [-1, 1]
+    left_rotation: float = 0.0
+    right_rotation: float = 0.0
+    
     # Vélocités (dérivées)
     vel_x: float = 0.0
     vel_y: float = 0.0
     vel_vergence: float = 0.0
+    vel_rotation: float = 0.0
     
     # Vergence (positif = convergent, négatif = divergent)
     vergence: float = 0.0
+    
+    # Effort musculaire (magnitude, 0-1)
+    effort: float = 0.0
     
     # Historique pour calcul de vélocité
     _prev_x: float = field(default=0.0, repr=False)
     _prev_y: float = field(default=0.0, repr=False)
     _prev_vergence: float = field(default=0.0, repr=False)
+    _prev_rotation: float = field(default=0.0, repr=False)
     
     def update(
         self,
@@ -1053,7 +1405,8 @@ class OculomotorState:
         gaze_y: float,
         vergence_offset: float,
         frame_width: float,
-        frame_height: float
+        frame_height: float,
+        rotation: float = 0.0
     ):
         """Met à jour l'état proprioceptif.
         
@@ -1061,6 +1414,7 @@ class OculomotorState:
             gaze_x, gaze_y: Position du regard en pixels
             vergence_offset: Offset de vergence en pixels
             frame_width, frame_height: Dimensions de l'image
+            rotation: Rotation/torsion en radians
         """
         # Normaliser les positions [-1, 1]
         center_x = frame_width / 2
@@ -1072,15 +1426,27 @@ class OculomotorState:
         # Vergence normalisée (typiquement [-0.1, 0.1])
         norm_verg = vergence_offset / center_x
         
+        # Rotation normalisée (typiquement ±30°)
+        norm_rot = np.clip(rotation / (np.pi / 6), -1, 1)
+        
         # Calculer les vélocités
         self.vel_x = norm_x - self._prev_x
         self.vel_y = norm_y - self._prev_y
         self.vel_vergence = norm_verg - self._prev_vergence
+        self.vel_rotation = norm_rot - self._prev_rotation
+        
+        # Calculer l'effort musculaire (magnitude du mouvement)
+        self.effort = np.sqrt(
+            self.vel_x**2 + self.vel_y**2 + 
+            self.vel_vergence**2 + self.vel_rotation**2
+        )
+        self.effort = np.clip(self.effort * 5, 0, 1)  # Normaliser
         
         # Mettre à jour les positions
         self._prev_x = norm_x
         self._prev_y = norm_y
         self._prev_vergence = norm_verg
+        self._prev_rotation = norm_rot
         
         # Positions des deux yeux
         self.left_x = norm_x + norm_verg / 2
@@ -1088,6 +1454,25 @@ class OculomotorState:
         self.right_x = norm_x - norm_verg / 2
         self.right_y = norm_y
         self.vergence = norm_verg
+        
+        # Rotation (cyclotorsion) - les yeux peuvent tourner en opposition
+        self.left_rotation = norm_rot
+        self.right_rotation = -norm_rot  # Opposition pour stabilisation
+    
+    def get_motor_vector(self) -> np.ndarray:
+        """Retourne le vecteur de commande motrice actuel.
+        
+        Utilisé pour la mémoire saccadique.
+        
+        Returns:
+            Array [dx, dy, d_vergence, d_rotation]
+        """
+        return np.array([
+            self.vel_x,
+            self.vel_y,
+            self.vel_vergence,
+            self.vel_rotation
+        ], dtype=np.float32)
     
     def to_spike_encoding(self, resolution: int = 8) -> np.ndarray:
         """Encode l'état en pattern de spikes.
@@ -1099,11 +1484,11 @@ class OculomotorState:
             resolution: Nombre de neurones par dimension
             
         Returns:
-            Array de spikes (6 × resolution) pour:
-            [pos_x, pos_y, vel_x, vel_y, vergence, vel_vergence]
+            Array de spikes (8 × resolution) pour:
+            [pos_x, pos_y, vel_x, vel_y, vergence, vel_vergence, rotation, effort]
         """
-        # 6 canaux × resolution neurones
-        spikes = np.zeros((6, resolution), dtype=np.float32)
+        # 8 canaux × resolution neurones
+        spikes = np.zeros((8, resolution), dtype=np.float32)
         
         # Encodage de population: chaque neurone a un "seuil préféré"
         thresholds = np.linspace(-1, 1, resolution)
@@ -1116,6 +1501,8 @@ class OculomotorState:
             self.vel_y * 10,                    # Vélocité Y (amplifié)
             self.vergence * 5,                  # Vergence (amplifié)
             self.vel_vergence * 20,             # Vélocité vergence (amplifié)
+            self.left_rotation,                 # Rotation (torsion)
+            self.effort * 2 - 1,                # Effort musculaire (recentré -1 à 1)
         ]
         
         for i, val in enumerate(values):
@@ -1129,20 +1516,20 @@ class OculomotorState:
         self, 
         motor_spikes: np.ndarray,
         resolution: int = 8
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, float]:
         """Décode des spikes moteurs en commande de mouvement.
         
         Args:
-            motor_spikes: Array (3 × resolution) pour [dx, dy, d_vergence]
+            motor_spikes: Array (4 × resolution) pour [dx, dy, d_vergence, d_rotation]
             resolution: Nombre de neurones par dimension
             
         Returns:
-            (delta_x, delta_y, delta_vergence) normalisés [-1, 1]
+            (delta_x, delta_y, delta_vergence, delta_rotation) normalisés [-1, 1]
         """
         thresholds = np.linspace(-1, 1, resolution)
         
         deltas = []
-        for i in range(min(3, motor_spikes.shape[0])):
+        for i in range(min(4, motor_spikes.shape[0])):
             # Décodage par moyenne pondérée
             weights = motor_spikes[i]
             if np.sum(weights) > 0.01:
@@ -1151,7 +1538,7 @@ class OculomotorState:
                 delta = 0.0
             deltas.append(delta)
         
-        while len(deltas) < 3:
+        while len(deltas) < 4:
             deltas.append(0.0)
             
         return tuple(deltas)
@@ -1274,7 +1661,9 @@ def draw_agent_overlay(
     saliency_peaks: List[SaliencyPoint],
     correlation: float,
     vergence_offset: float = 0.0,
-    is_left_eye: bool = True
+    is_left_eye: bool = True,
+    direct_vergence: bool = False,
+    vergence_correlation: float = 0.0
 ) -> np.ndarray:
     """Dessine l'overlay de l'agent sur l'image."""
     img = image.copy()
@@ -1339,9 +1728,13 @@ def draw_agent_overlay(
     verg_center = bar_x + bar_width // 2
     verg_scale = 2.0  # pixels par unité de vergence
     
-    # Afficher la valeur numérique
-    cv2.putText(img, f"Verg: {vergence_offset:+.1f}px", (bar_x, verg_y + 5),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+    # Indicateur de type de vergence (directe = mesure binoculaire, corrélation = template matching)
+    verg_type = "DIRECT" if direct_vergence else f"NCC:{vergence_correlation:.2f}"
+    verg_type_color = (0, 255, 100) if direct_vergence else (180, 180, 180)
+    
+    # Afficher la valeur numérique avec type
+    cv2.putText(img, f"Verg: {vergence_offset:+.1f}px [{verg_type}]", (bar_x, verg_y + 5),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.35, verg_type_color, 1)
     
     if abs(vergence_offset) > 0.5:
         verg_end = int(verg_center + vergence_offset * verg_scale * (1 if is_left_eye else -1))
@@ -1350,8 +1743,11 @@ def draw_agent_overlay(
         cv2.line(img, (bar_x, verg_y), (bar_x + bar_width, verg_y), (80, 80, 80), 1)
         # Marqueur central
         cv2.line(img, (verg_center, verg_y - 3), (verg_center, verg_y + 3), (150, 150, 150), 1)
-        # Flèche de vergence
-        verg_color = (255, 200, 100) if vergence_offset > 0 else (100, 200, 255)
+        # Flèche de vergence - verte si directe, orange/bleu si corrélation
+        if direct_vergence:
+            verg_color = (0, 255, 100)  # Vert = vergence directe fiable
+        else:
+            verg_color = (255, 200, 100) if vergence_offset > 0 else (100, 200, 255)
         cv2.arrowedLine(img, (verg_center, verg_y), (verg_end, verg_y), verg_color, 2, tipLength=0.3)
     
     return img
@@ -1466,6 +1862,9 @@ def main():
             # Visualisation
             # Dessiner l'overlay sur les deux images avec vergence dynamique
             vergence = result['vergence_offset']
+            direct_verg = result.get('direct_vergence', False)
+            verg_corr = result.get('vergence_correlation', 0.0)
+            
             left_viz = draw_agent_overlay(
                 left, 
                 result['gaze_x'],  # Position œil gauche (directe)
@@ -1476,7 +1875,9 @@ def main():
                 result['saliency_peaks'],
                 result['correlation'],
                 vergence_offset=vergence,
-                is_left_eye=True
+                is_left_eye=True,
+                direct_vergence=direct_verg,
+                vergence_correlation=verg_corr
             )
             right_viz = draw_agent_overlay(
                 right,
@@ -1488,7 +1889,9 @@ def main():
                 result['saliency_peaks'],
                 result['correlation'],
                 vergence_offset=vergence,
-                is_left_eye=False
+                is_left_eye=False,
+                direct_vergence=direct_verg,
+                vergence_correlation=verg_corr
             )
             
             # Visualisation des fovéas
@@ -1582,6 +1985,12 @@ def main():
             neurons_text = f"Neurons: {result['stack_neurons']} (P:{result['stack_patterns']} S:{result['stack_stable']})"
             cv2.putText(display, neurons_text, (display_w + 120, 65),
                        font, 0.4, (255, 200, 100), 1)
+            
+            # Affichage mémoire saccadique et effort musculaire
+            saccade_stats = result.get('saccade_memory_stats', {})
+            mem_text = f"SacMem: {saccade_stats.get('num_memories', 0)} Effort: {result.get('motor_effort', 0):.2f}"
+            cv2.putText(display, mem_text, (display_w + 10, 105),
+                       font, 0.4, (200, 150, 255), 1)
             
             # Affichage infos couleur et mouvement (si mode couleur)
             if args.color and result['left_motion'] is not None:
