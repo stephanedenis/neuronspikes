@@ -476,22 +476,67 @@ class AttentionAgent:
             source_left = left_color if left_color is not None else left_gray
             source_right = right_color if right_color is not None else right_gray
             
+            # CORRECTION: Extraire une fenêtre autour du point de fixation actuel
+            # Plutôt que de traiter l'image complète, on simule la région rétinienne
+            gaze_x = int(self.gaze.x)
+            gaze_y = int(self.gaze.y)
+            
+            # Taille de la fenêtre rétinienne (2x le rayon max de la fovéa)
+            fovea_radius = int(self.config.max_radius * 1.5)
+            fovea_size = fovea_radius * 2
+            
+            # Bornes de la fenêtre (avec clipping)
+            img_h, img_w = source_left.shape[:2]
+            x1 = max(0, gaze_x - fovea_radius)
+            y1 = max(0, gaze_y - fovea_radius)
+            x2 = min(img_w, gaze_x + fovea_radius)
+            y2 = min(img_h, gaze_y + fovea_radius)
+            
+            # Extraire la région fovéale
+            fovea_region_left = source_left[y1:y2, x1:x2]
+            
             # Traiter avec le processeur rétinien (Magno/Parvo/V1)
-            result_left = self.retinal_processor.process(source_left)
+            # Maintenant on traite SEULEMENT la région autour du regard
+            if fovea_region_left.size > 0 and fovea_region_left.shape[0] > 10 and fovea_region_left.shape[1] > 10:
+                result_left = self.retinal_processor.process(fovea_region_left)
+            else:
+                # Fallback: traiter l'image complète si région trop petite
+                result_left = self.retinal_processor.process(source_left)
+                x1, y1 = 0, 0
+                fovea_size = max(img_h, img_w)
             
             # Saillance bio-inspirée combinant mouvement, couleur et orientation
             bio_saliency = result_left['saliency']
             
-            # Stocker pour visualisation
+            # Stocker pour visualisation (avec offset pour savoir où c'est)
             self._last_retinal_result = result_left
+            self._last_retinal_offset = (x1, y1)  # Offset de la région
             
-            # Redimensionner à la taille de travail
-            bio_saliency_resized = cv2.resize(bio_saliency, (w, h))
+            # La saillance est relative à la fenêtre fovéale
+            # On doit la mapper vers l'espace de l'image complète
+            fovea_h, fovea_w = bio_saliency.shape
+            
+            # Créer une carte de saillance vide pour l'image complète
+            full_bio_saliency = np.zeros((h, w), dtype=np.float32)
+            
+            # Mapper la région fovéale vers l'espace réduit
+            x1_small = int(x1 / scale_x)
+            y1_small = int(y1 / scale_y)
+            x2_small = int(x2 / scale_x)
+            y2_small = int(y2 / scale_y)
+            
+            # Redimensionner la saillance fovéale à la taille cible
+            target_w = max(1, x2_small - x1_small)
+            target_h = max(1, y2_small - y1_small)
+            bio_saliency_region = cv2.resize(bio_saliency, (target_w, target_h))
+            
+            # Insérer dans la carte complète
+            full_bio_saliency[y1_small:y1_small+target_h, x1_small:x1_small+target_w] = bio_saliency_region
             
             # Combiner avec la saillance par corrélation stéréo
-            # Saillance bio = bottom-up (ce qui attire l'attention)
-            # Saillance stéréo = top-down (ce qui est binoculairement pertinent)
-            combined_saliency = 0.6 * bio_saliency_resized + 0.4 * (saliency_left * saliency_right)
+            # Saillance bio = bottom-up (ce qui attire l'attention dans la fovéa)
+            # Saillance stéréo = top-down (ce qui est binoculairement pertinent partout)
+            combined_saliency = 0.6 * full_bio_saliency + 0.4 * (saliency_left * saliency_right)
             
             # Détecter les pics dans la saillance combinée
             for y in range(1, h - 1):

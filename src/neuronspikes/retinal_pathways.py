@@ -98,8 +98,8 @@ class MagnocellularPathway:
         else:
             blurred = self._gaussian_blur_numpy(gray, self.config.magno_sigma)
         
-        # Première frame: initialiser
-        if self.prev_frame is None:
+        # Première frame ou changement de taille: réinitialiser
+        if self.prev_frame is None or self.prev_frame.shape != blurred.shape:
             self.prev_frame = blurred.copy()
             self.motion_accumulator = np.zeros_like(blurred)
             return np.zeros_like(blurred), np.zeros_like(blurred)
