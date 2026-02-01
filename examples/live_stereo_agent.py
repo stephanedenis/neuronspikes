@@ -2331,10 +2331,14 @@ def main():
                 vergence_correlation=verg_corr
             )
             
-            # Visualisation des fovéas polaires
-            panel_size = 200
-            left_fovea_viz = visualize_fovea(agent.left_fovea, size=panel_size)
-            right_fovea_viz = visualize_fovea(agent.right_fovea, size=panel_size)
+            # === VISUALISATIONS POLAIRES (carrées, sans grille) ===
+            # Utiliser la hauteur du panneau pour garder le ratio 1:1
+            panel_row_height = int(screen_height * 0.45)
+            panel_size = panel_row_height  # Carré!
+            
+            # Fovéas polaires SANS grille
+            left_fovea_viz = visualize_fovea(agent.left_fovea, size=panel_size, show_grid=False)
+            right_fovea_viz = visualize_fovea(agent.right_fovea, size=panel_size, show_grid=False)
             
             # Visualisation des canaux polaires (si mode couleur)
             if args.color:
@@ -2349,53 +2353,95 @@ def main():
                 cv2.putText(right_channels, "Mode", (10, panel_size//2 + 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
             
-            # Visualisation du NeuronStack
+            # Visualisation du NeuronStack (carré)
             stack_viz = draw_neuron_stack_2d(agent.neuron_stack, size=panel_size)
             
-            # Visualisation des voies rétiniennes bio-inspirées
+            # Visualisation des voies rétiniennes bio-inspirées (carré)
             retinal_viz = draw_retinal_pathways(result.get('retinal_result'), size=panel_size)
             
-            # Carte de corrélation ou disparité
+            # Carte de corrélation ou disparité (carrée)
             correlation_viz = draw_correlation_map(
                 result['left_act'], result['right_act'], 
                 size=panel_size, show_disparity=show_disparity
             )
             
-            # === LAYOUT PLEIN ÉCRAN ===
+            # === LAYOUT PLEIN ÉCRAN - L+R CÔTE À CÔTE ===
             # Ligne 1: Caméras stéréo (55% hauteur)
-            cam_height = int(screen_height * 0.55)
+            cam_height = screen_height - panel_row_height
             half_width = screen_width // 2
             
             left_cam_resized = cv2.resize(left_viz, (half_width, cam_height))
             right_cam_resized = cv2.resize(right_viz, (half_width, cam_height))
             
-            # Ligne 2: 7 panneaux de visualisation (45% hauteur)
-            panel_row_height = screen_height - cam_height
-            num_panels = 7
-            panel_w = screen_width // num_panels
+            # Ligne 2: Panneaux L+R appairés (45% hauteur)
+            # Layout: [Fovea_L][Canaux_L][Corr][Stack][Retinal][Canaux_R][Fovea_R]
+            # Mais on veut L+R côte à côte, donc:
+            # [Fovea_L | Fovea_R] [Canaux_L | Canaux_R] [Corr] [Stack] [Retinal]
             
-            # Créer les 7 panneaux: Fovea L | Channels L | Corr | Stack | Retinal | Channels R | Fovea R
-            panels = [
-                cv2.resize(left_fovea_viz, (panel_w, panel_row_height)),
-                cv2.resize(left_channels, (panel_w, panel_row_height)),
-                cv2.resize(correlation_viz, (panel_w, panel_row_height)),
-                cv2.resize(stack_viz, (panel_w, panel_row_height)),
-                cv2.resize(retinal_viz, (panel_w, panel_row_height)),
-                cv2.resize(right_channels, (panel_w, panel_row_height)),
-                cv2.resize(right_fovea_viz, (panel_w, panel_row_height)),
-            ]
+            # Calculer les largeurs pour 5 groupes
+            num_groups = 5
+            group_width = screen_width // num_groups
             
-            # Assembler le display
+            # Créer les paires L+R côte à côte (carrées, centrées dans leur groupe)
+            def make_pair(left_img, right_img, target_width, target_height):
+                """Crée une paire L+R côte à côte, images carrées centrées."""
+                # Chaque image prend la moitié de la largeur
+                img_size = min(target_width // 2, target_height)
+                left_resized = cv2.resize(left_img, (img_size, img_size))
+                right_resized = cv2.resize(right_img, (img_size, img_size))
+                
+                # Créer le canvas
+                pair = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+                
+                # Centrer verticalement
+                y_offset = (target_height - img_size) // 2
+                x_left = 0
+                x_right = target_width // 2
+                
+                pair[y_offset:y_offset+img_size, x_left:x_left+img_size] = left_resized
+                pair[y_offset:y_offset+img_size, x_right:x_right+img_size] = right_resized
+                
+                return pair
+            
+            def make_single(img, target_width, target_height):
+                """Crée une image carrée centrée."""
+                img_size = min(target_width, target_height)
+                resized = cv2.resize(img, (img_size, img_size))
+                
+                canvas = np.zeros((target_height, target_width, 3), dtype=np.uint8)
+                x_offset = (target_width - img_size) // 2
+                y_offset = (target_height - img_size) // 2
+                canvas[y_offset:y_offset+img_size, x_offset:x_offset+img_size] = resized
+                
+                return canvas
+            
+            # Créer les 5 groupes
+            fovea_pair = make_pair(left_fovea_viz, right_fovea_viz, group_width, panel_row_height)
+            channels_pair = make_pair(left_channels, right_channels, group_width, panel_row_height)
+            corr_single = make_single(correlation_viz, group_width, panel_row_height)
+            stack_single = make_single(stack_viz, group_width, panel_row_height)
+            retinal_single = make_single(retinal_viz, group_width, panel_row_height)
+            
+            # Assembler la rangée de panneaux
+            panels_row = np.hstack([fovea_pair, channels_pair, corr_single, stack_single, retinal_single])
+            
+            # Ajuster la largeur si nécessaire
+            if panels_row.shape[1] != screen_width:
+                panels_row = cv2.resize(panels_row, (screen_width, panel_row_height))
+            
+            # Assembler le display final
             row1 = np.hstack([left_cam_resized, right_cam_resized])
-            row2 = np.hstack(panels)
-            # Ajuster la largeur de row2 si nécessaire
-            if row2.shape[1] != row1.shape[1]:
-                row2 = cv2.resize(row2, (row1.shape[1], panel_row_height))
-            
-            display = np.vstack([row1, row2])
+            display = np.vstack([row1, panels_row])
             
             # === OVERLAY D'INFORMATION ===
             font = cv2.FONT_HERSHEY_SIMPLEX
+            
+            # Labels des panneaux
+            labels = ["FOVEA L|R", "CANAUX L|R", "CORR/DISP", "NEURONS", "RETINAL"]
+            for i, label in enumerate(labels):
+                x = i * group_width + group_width // 2 - len(label) * 4
+                cv2.putText(display, label, (x, cam_height + 18),
+                           font, 0.4, (200, 200, 200), 1)
             
             # Infos en haut à gauche
             gpu_info = "GPU" if agent.opencl else "CPU"
@@ -2431,13 +2477,6 @@ def main():
                 motion_text = f"Motion: {motion.magnitude:.1f}px @{math.degrees(motion.direction):.0f}°"
                 cv2.putText(display, motion_text, (10, 85),
                            font, 0.5, (100, 150, 255), 1)
-            
-            # Labels des panneaux (en bas)
-            labels = ["FOVEA L", "CANAUX L", "CORR/DISP", "NEURONS", "RETINAL", "CANAUX R", "FOVEA R"]
-            for i, label in enumerate(labels):
-                x = i * panel_w + panel_w // 2 - len(label) * 4
-                cv2.putText(display, label, (x, cam_height + 18),
-                           font, 0.4, (200, 200, 200), 1)
             
             # Mode couleur indicator
             if args.color:
