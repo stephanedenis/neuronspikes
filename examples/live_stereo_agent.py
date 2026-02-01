@@ -24,10 +24,10 @@ Options:
 Touches:
     q, ESC  Quitter
     SPACE   Pause/Reprendre
-    a       Toggle mode autonome / manuel
     r       Reset des fovéas au centre
     d       Mode disparité / corrélation
-    s       Forcer une saccade aléatoire
+    +/-     Zoom avant/arrière
+    i       Statistiques attention
 """
 
 import argparse
@@ -284,7 +284,6 @@ class AttentionAgent:
         self._pre_saccade_pattern: Optional[np.ndarray] = None
         
         # État
-        self.autonomous = True
         self.frame_count = 0
         self.last_saccade_frame = 0
         self.min_saccade_interval = 15  # Frames minimum entre saccades (plus stable)
@@ -730,10 +729,6 @@ class AttentionAgent:
         Returns:
             Nouvelle cible (x, y) ou None si pas de mouvement
         """
-        # Pas d'action si pas en mode autonome
-        if not self.autonomous:
-            return None
-        
         # Pas de saccade trop fréquente - laisser le temps à la vergence
         frames_since_saccade = self.frame_count - self.last_saccade_frame
         if frames_since_saccade < self.min_saccade_interval:
@@ -1115,12 +1110,6 @@ class AttentionAgent:
         """Force une saccade vers une position."""
         self.gaze.saccade_to(x, y)
         self.last_saccade_frame = self.frame_count
-    
-    def random_saccade(self):
-        """Effectue une saccade vers une position aléatoire."""
-        x = np.random.uniform(self.gaze.min_x, self.gaze.max_x)
-        y = np.random.uniform(self.gaze.min_y, self.gaze.max_y)
-        self.force_saccade_to(x, y)
     
     def reset(self):
         """Réinitialise au centre."""
@@ -1958,13 +1947,11 @@ def main():
     fps = 0.0
     show_disparity = False
     
-    print("\n=== Agent Stéréo avec Attention ===")
-    print("Mode AUTONOME activé - Les yeux cherchent les détails communs")
+    print("\n=== Agent Stéréo Déterministe ===")
+    print("Système autonome - Exploration guidée par saillance")
     print("Zoom adaptatif et inhibition de retour activés")
     print("")
     print("Touches:")
-    print("  a     Toggle autonome/manuel")
-    print("  s     Saccade aléatoire")
     print("  r     Reset au centre (efface mémoire)")
     print("  d     Toggle disparité/corrélation")
     print("  +/-   Zoom avant/arrière")
@@ -2112,10 +2099,6 @@ def main():
             
             # Ajouter les labels
             font = cv2.FONT_HERSHEY_SIMPLEX
-            mode_text = "AUTONOME" if agent.autonomous else "MANUEL"
-            mode_color = (0, 255, 0) if agent.autonomous else (0, 165, 255)
-            cv2.putText(display, f"Mode: {mode_text}", (display_w - 120, 25), 
-                       font, 0.5, mode_color, 1)
             
             # Affichage FPS et GPU
             gpu_info = "GPU" if agent.opencl else "CPU"
@@ -2189,12 +2172,6 @@ def main():
             
             if key in (ord('q'), 27):
                 break
-            elif key == ord('a'):
-                agent.autonomous = not agent.autonomous
-                print(f"Mode: {'AUTONOME' if agent.autonomous else 'MANUEL'}")
-            elif key == ord('s'):
-                agent.random_saccade()
-                print("Saccade aléatoire!")
             elif key == ord('r'):
                 agent.reset()
                 agent.attention.reset()
