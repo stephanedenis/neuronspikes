@@ -428,10 +428,20 @@ class NeuronVisualizer3D:
             y -= 15
             
             # Par couche
+            patterns_per_layer = stats.get('patterns_per_layer', [])
+            stable_per_layer = stats.get('stable_patterns_per_layer', [])
+            
             for i, (count, spikes) in enumerate(zip(stats['neurons_per_layer'], stats['spikes_per_layer'])):
                 color = LAYER_COLORS[i % len(LAYER_COLORS)]
                 glColor3f(*color)
-                self._draw_text(10, y, f"  L{i}: {count} neurons, {spikes} spikes")
+                
+                # Afficher patterns si disponibles
+                if i < len(patterns_per_layer):
+                    patterns = patterns_per_layer[i]
+                    stable = stable_per_layer[i] if i < len(stable_per_layer) else 0
+                    self._draw_text(10, y, f"  L{i}: {count} neurons, {spikes} spikes | {patterns} patterns ({stable} stable)")
+                else:
+                    self._draw_text(10, y, f"  L{i}: {count} neurons, {spikes} spikes")
                 y -= 12
         
         if self.paused:

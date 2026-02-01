@@ -104,6 +104,7 @@ class Neuron:
         
         Args:
             input_pattern: Pattern d'activation de l'entrée (même shape que RF)
+                          Peut être booléen ou flottant [0-1]
             
         Returns:
             Score d'activation [0-1]
@@ -111,8 +112,14 @@ class Neuron:
         if self._rf_size == 0:
             return 0.0
         
+        # Convertir l'entrée en booléen si c'est un float
+        if input_pattern.dtype in (np.float32, np.float64, float):
+            input_bool = input_pattern > 0.5
+        else:
+            input_bool = input_pattern.astype(bool)
+        
         # Intersection: combien de pixels du RF sont actifs dans l'entrée
-        overlap = np.sum(self.receptive_field & input_pattern)
+        overlap = np.sum(self.receptive_field & input_bool)
         
         # Normaliser par la taille du RF
         return float(overlap / self._rf_size)
@@ -481,9 +488,15 @@ class NeuronStack:
         self.neuron_config = neuron_config or NeuronConfig()
         self.reduction_factor = reduction_factor
         
-        # Créer les couches
+        # Import ici pour éviter import circulaire
+        from .temporal import TemporalCorrelator, CorrelationConfig
+        from .groups import GroupDetector, GroupDetectorConfig
+        
+        # Créer les couches avec leurs corrélateurs
         self._layers: list[NeuronLayer] = []
         self._layer_shapes: list[tuple[int, int]] = []
+        self._correlators: list[TemporalCorrelator] = []
+        self._group_detectors: list[GroupDetector] = []
         
         current_shape = base_shape
         for layer_id in range(num_layers):
@@ -493,6 +506,26 @@ class NeuronStack:
                 shape=current_shape,
                 config=self.config,
                 neuron_config=self.neuron_config,
+            ))
+            
+            # Corrélateur temporel pour cette couche
+            self._correlators.append(TemporalCorrelator(
+                shape=current_shape,
+                config=CorrelationConfig(
+                    history_size=30,
+                    min_overlap=0.6,
+                    min_occurrences=5,
+                    confidence_threshold=0.6,
+                )
+            ))
+            
+            # Détecteur de groupes pour cette couche
+            self._group_detectors.append(GroupDetector(
+                config=GroupDetectorConfig(
+                    min_group_size=3,
+                    connectivity=8,
+                    track_history=30,
+                )
             ))
             
             # Réduire la résolution pour la couche suivante
@@ -505,6 +538,7 @@ class NeuronStack:
         # Statistiques
         self._frame_count = 0
         self._propagation_enabled = True
+        self._auto_genesis = True  # Création automatique de neurones
     
     @property
     def layers(self) -> list[NeuronLayer]:
@@ -525,19 +559,28 @@ class NeuronStack:
     def process(
         self,
         input_pattern: np.ndarray,
-        propagate: bool = True
+        propagate: bool = True,
+        learn: bool = True
     ) -> list[np.ndarray]:
         """Traite une entrée à travers toutes les couches.
+        
+        Chaque couche:
+        1. Détecte les groupes d'activation
+        2. Cherche des patterns temporels récurrents
+        3. Crée des neurones pour les patterns stables
+        4. Propage les activations neuronales vers la couche supérieure
         
         Args:
             input_pattern: Pattern d'activation de l'entrée (H, W) booléen
             propagate: Si True, propage vers les couches supérieures
+            learn: Si True, crée des neurones pour les patterns stables
             
         Returns:
             Liste des sorties de chaque couche
         """
         self._frame_count += 1
         outputs = []
+        neurons_created_this_frame = []
         
         current_input = input_pattern
         
@@ -548,13 +591,45 @@ class NeuronStack:
                     current_input, layer.shape
                 )
             
-            # Traiter la couche
+            # 1. Détecter les groupes d'activation dans l'entrée (convertir en booléen)
+            activation_mask = current_input > 0.5  # Seuil d'activation
+            groups = self._group_detectors[layer_idx].detect_groups(
+                activation_mask, 
+                slot=0, 
+                frame=self._frame_count
+            )
+            
+            # 2. Corrélation temporelle: chercher les patterns récurrents
+            if learn and self._auto_genesis:
+                self._correlators[layer_idx].process_groups(groups)
+                
+                # 3. Créer des neurones pour les patterns stables
+                stable_patterns = self._correlators[layer_idx].stable_patterns
+                for pattern in stable_patterns:
+                    neuron = layer.create_neuron_from_pattern(pattern)
+                    if neuron is not None:
+                        neurons_created_this_frame.append((layer_idx, neuron))
+            
+            # 4. Traiter avec les neurones existants
             output = layer.process(current_input)
             outputs.append(output)
             
             # Préparer l'entrée pour la couche suivante
+            # La sortie = neurones qui ont spiké (leurs champs récepteurs)
             if propagate and layer_idx < len(self._layers) - 1:
                 current_input = output
+        
+        return outputs
+    
+    @property
+    def auto_genesis(self) -> bool:
+        """Activation de la création automatique de neurones."""
+        return self._auto_genesis
+    
+    @auto_genesis.setter
+    def auto_genesis(self, value: bool):
+        """Active/désactive la création automatique de neurones."""
+        self._auto_genesis = value
         
         return outputs
     
@@ -640,13 +715,24 @@ class NeuronStack:
     def get_stats(self) -> dict:
         """Statistiques globales de la pile."""
         layer_stats = [layer.get_stats() for layer in self._layers]
+        correlator_stats = [
+            {
+                'pattern_count': c.pattern_count,
+                'stable_patterns': len(c.stable_patterns),
+            }
+            for c in self._correlators
+        ]
         return {
             'num_layers': self.num_layers,
             'total_neurons': self.total_neurons,
             'frame_count': self._frame_count,
+            'auto_genesis': self._auto_genesis,
             'layers': layer_stats,
+            'correlators': correlator_stats,
             'neurons_per_layer': [s['neuron_count'] for s in layer_stats],
             'spikes_per_layer': [s['total_spikes'] for s in layer_stats],
+            'patterns_per_layer': [c['pattern_count'] for c in correlator_stats],
+            'stable_patterns_per_layer': [c['stable_patterns'] for c in correlator_stats],
         }
     
     def reset(self):
